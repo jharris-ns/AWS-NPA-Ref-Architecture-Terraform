@@ -1,0 +1,61 @@
+#!/bin/bash
+# ==============================================================================
+# NPA Publisher User Data Script
+# ==============================================================================
+# This script runs automatically when the EC2 instance first boots.
+# It's called "user data" in AWS terminology.
+#
+# What this script does:
+#   1. Registers the publisher with Netskope using a unique token
+#   2. Optionally installs and configures CloudWatch agent for monitoring
+#
+# Template variables (substituted by Terraform):
+#   registration_token - Netskope publisher registration token
+#   enable_cloudwatch  - Boolean flag for CloudWatch agent installation
+#   cloudwatch_config_parameter - SSM parameter name for agent config
+#
+# Terraform template syntax:
+#   Variables: Use dollar-brace syntax to interpolate values
+#   Conditionals: Use percent-brace if/endif for conditional sections
+# ==============================================================================
+
+# Exit immediately if any command fails
+# This prevents partial/broken installations
+set -e
+
+echo "Starting NPA Publisher registration..."
+
+# ------------------------------------------------------------------------------
+# Register with Netskope
+# ------------------------------------------------------------------------------
+# The npa-publisher-wizard is pre-installed on the Netskope Publisher AMI.
+# It validates the token, configures the publisher service, and establishes
+# the outbound connection to Netskope cloud.
+# ------------------------------------------------------------------------------
+/home/ubuntu/npa_publisher_wizard -token ${registration_token}
+
+echo "NPA Publisher registration complete"
+
+# ------------------------------------------------------------------------------
+# CloudWatch Agent Installation (Conditional)
+# ------------------------------------------------------------------------------
+# This section only runs if enable_cloudwatch is true.
+# CloudWatch agent collects memory and disk metrics not available by default.
+# ------------------------------------------------------------------------------
+%{ if enable_cloudwatch ~}
+echo "Installing CloudWatch agent..."
+
+# Download the CloudWatch agent package from AWS
+wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+
+# Install the package
+dpkg -i -E ./amazon-cloudwatch-agent.deb
+
+# Clean up
+rm amazon-cloudwatch-agent.deb
+
+# Configure and start the agent using config from SSM Parameter Store
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c ssm:${cloudwatch_config_parameter}
+
+echo "CloudWatch agent installed and configured"
+%{ endif ~}

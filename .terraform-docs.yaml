@@ -1,0 +1,103 @@
+# ==============================================================================
+# Terraform-docs Configuration
+# ==============================================================================
+# Terraform-docs auto-generates documentation from your Terraform code.
+# It extracts variable definitions, outputs, and module information to
+# create consistent, up-to-date documentation.
+#
+# Installation:
+#   brew install terraform-docs            # macOS
+#   choco install terraform-docs           # Windows
+#   go install github.com/terraform-docs/terraform-docs@latest
+#
+# Usage:
+#   terraform-docs markdown .              # Generate markdown
+#   terraform-docs markdown . > README.md  # Write to file
+#
+# With pre-commit hooks, documentation is auto-updated on each commit.
+# ==============================================================================
+
+# Output format configuration
+formatter: markdown table
+
+# Output file settings
+output:
+  file: README.md
+  mode: inject
+  template: |-
+    <!-- BEGIN_TF_DOCS -->
+    {{ .Content }}
+    <!-- END_TF_DOCS -->
+
+# Content configuration
+content: |-
+  ## Requirements
+
+  {{ .Requirements }}
+
+  ## Providers
+
+  {{ .Providers }}
+
+  ## Modules
+
+  {{ .Modules }}
+
+  ## Resources
+
+  {{ .Resources }}
+
+  ## Inputs
+
+  {{ .Inputs }}
+
+  ## Outputs
+
+  {{ .Outputs }}
+
+# Section ordering
+sections:
+  show:
+    - requirements
+    - providers
+    - modules
+    - resources
+    - inputs
+    - outputs
+
+# Sorting
+sort:
+  enabled: true
+  by: required
+
+# Output settings
+settings:
+  # Anchor links for inputs/outputs
+  anchor: true
+
+  # Show default values in inputs table
+  default: true
+
+  # Escape markdown characters in descriptions
+  escape: true
+
+  # Hide empty sections
+  hide-empty: false
+
+  # HTML formatting
+  html: true
+
+  # Indent level for nested items
+  indent: 2
+
+  # Include type information
+  type: true
+
+  # Include required column
+  required: true
+
+  # Lockfile parsing (for provider versions)
+  lockfile: true
+
+  # Read comments from .tf files
+  read-comments: true
