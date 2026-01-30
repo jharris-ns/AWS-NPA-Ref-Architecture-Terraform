@@ -232,7 +232,7 @@ The minimum IAM policy for deploying the NPA Publisher infrastructure.
 | Service | Actions | Purpose |
 |---|---|---|
 | **EC2** | RunInstances, TerminateInstances, Describe* | Manage publisher instances |
-| **VPC** | Create/Delete VPC, Subnets, NAT, IGW, Routes | Network infrastructure |
+| **VPC** | Create/Delete VPC, Subnets, NAT, IGW, Routes, VPC Endpoints | Network infrastructure |
 | **Security Groups** | Create/Delete, Authorize/Revoke rules | Firewall management |
 | **IAM** | Create/Delete roles, profiles, attach policies | Instance role management |
 | **SSM** | PutParameter, StartSession | CloudWatch config, shell access |

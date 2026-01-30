@@ -6,9 +6,8 @@
 .terraform/
 **/.terraform/
 
-# Terraform lock files (include in version control per HashiCorp recommendation)
-# Uncomment if you want to exclude:
-# .terraform.lock.hcl
+# Terraform lock files
+.terraform.lock.hcl
 
 # State files (should use remote backend, not local)
 *.tfstate

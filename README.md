@@ -250,7 +250,6 @@ AWS-NPA-Ref-Architecture-Terraform/
 │   │       ├── outputs.tf
 │   │       └── terraform.tfvars.example
 │   │
-│   └── .terraform.lock.hcl          # Provider dependency lock file
 │
 ├── .pre-commit-config.yaml          # Pre-commit hooks (fmt, validate, tfsec, checkov)
 ├── .terraform-docs.yaml             # terraform-docs configuration
