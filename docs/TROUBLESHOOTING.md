@@ -95,9 +95,10 @@ Common apply errors:
 **Causes:**
 - **NAT Gateway**: Creation takes 2-3 minutes (normal)
 - **EC2 Instance**: Launch takes 30-60 seconds (normal)
+- **SSM polling**: `null_resource.publisher_registration` polls SSM until the instance is online (up to 10 minutes)
 - **Netskope API timeout**: Provider waiting for API response
 
-**Solution:** Wait for the operation to complete or timeout. If stuck for more than 10 minutes, press Ctrl+C and investigate:
+**Solution:** Wait for the operation to complete or timeout. SSM polling can take several minutes as it waits for the instance to boot and the SSM agent to connect. If stuck for more than 15 minutes, press Ctrl+C and investigate:
 
 ```bash
 # Check if resources were partially created
@@ -222,29 +223,49 @@ aws ec2 describe-instances \
 - **InvalidAMI**: AMI not available in region or subscription expired
 - **InstanceLimitExceeded**: Request EC2 quota increase
 
-### Issue: User Data Script Failed
+### Issue: SSM Registration Failed
 
-**Symptom:** Instance is running but publisher is not connected in Netskope
+**Symptom:** `terraform apply` fails during `null_resource.publisher_registration` or publisher is not connected in Netskope
+
+**Check Terraform output first** — registration errors are displayed in the `terraform apply` output, including the SSM command status and any error messages.
 
 **Diagnose via SSM Session Manager:**
 ```bash
 aws ssm start-session --target "$INSTANCE_ID"
 
-# Check user data execution log
-sudo cat /var/log/cloud-init-output.log
-
-# Check if npa-publisher-wizard ran
-sudo grep -i "npa" /var/log/cloud-init-output.log
-sudo grep -i "error" /var/log/cloud-init-output.log
-
 # Check publisher service status
 systemctl status npa_publisher_wizard || systemctl status npa_publisher
+
+# Check docker logs (publisher runs in a container)
+sudo docker logs $(sudo docker ps -q) 2>&1 | tail -20
+```
+
+**Check SSM command history:**
+```bash
+# List recent commands for the instance
+aws ssm list-command-invocations \
+  --instance-id "$INSTANCE_ID" \
+  --query 'CommandInvocations[*].[CommandId,Status,RequestedDateTime]' \
+  --output table
 ```
 
 **Common causes:**
-- **Invalid registration token**: Token may have expired or been used
+- **Instance not SSM-managed**: SSM agent not running or no network connectivity. Check VPC endpoints and NAT Gateway
+- **Invalid registration token**: Token may have been consumed by a previous attempt (tokens are single-use)
 - **Network issue**: Instance cannot reach Netskope endpoints
-- **wizard not found**: AMI may not have the wizard installed
+- **SSM polling timeout**: Instance took too long to come online (max 10 minutes)
+
+**Recovery:**
+```bash
+# Re-run registration
+terraform apply -replace='null_resource.publisher_registration["my-publisher"]'
+
+# If token was consumed, replace everything
+terraform apply \
+  -replace='netskope_npa_publisher.this["my-publisher"]' \
+  -replace='netskope_npa_publisher_token.this["my-publisher"]' \
+  -replace='aws_instance.publisher["my-publisher"]'
+```
 
 ### Issue: Instance Not Appearing in SSM
 
@@ -321,9 +342,7 @@ aws ec2 describe-security-groups \
 ```
 
 Required egress:
-- HTTPS (443) to Netskope NewEdge IPs: `8.36.116.0/24`, `8.39.144.0/24`, `31.186.239.0/24`, `163.116.128.0/17`, `162.10.0.0/17`
-- HTTPS (443) to 0.0.0.0/0 (for registration)
-- DNS (UDP 53) to 0.0.0.0/0
+- All outbound traffic to 0.0.0.0/0 (the default security group configuration allows all outbound)
 
 ### Issue: NAT Gateway Not Working
 

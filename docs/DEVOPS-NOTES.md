@@ -8,10 +8,9 @@ Technical deep-dive into the Terraform patterns, Netskope provider integration, 
 - [Publisher Registration Flow](#publisher-registration-flow)
 - [for_each Pattern](#for_each-pattern)
 - [Conditional Resource Creation](#conditional-resource-creation)
-- [User Data Template](#user-data-template)
+- [User Data Template and SSM Registration](#user-data-template)
 - [IAM Configuration](#iam-configuration)
 - [Pre-commit Hooks and Code Quality](#pre-commit-hooks-and-code-quality)
-- [Testing with Terratest](#testing-with-terratest)
 - [Lifecycle Rules](#lifecycle-rules)
 - [Provider Version Constraints](#provider-version-constraints)
 
@@ -80,40 +79,52 @@ The end-to-end flow from Terraform to a connected publisher:
 2. Terraform creates netskope_npa_publisher_token
    └─ API call to Netskope → registration token generated
 
-3. Terraform renders user data template (templatefile)
-   └─ Token embedded in startup script
+3. Terraform stores token in SSM Parameter Store (SecureString)
+   └─ aws_ssm_parameter.publisher_token (encrypted at rest with KMS)
 
-4. Terraform creates aws_instance with user data
+4. Terraform creates aws_instance with minimal user data
    └─ EC2 instance launches in private subnet
+   └─ User data only installs CloudWatch agent (if enabled)
 
-5. EC2 instance boots and executes user data script
-   └─ /home/ubuntu/npa_publisher_wizard -token <TOKEN>
+5. null_resource.publisher_registration polls SSM
+   └─ Waits for instance to appear as "Online" in SSM
+   └─ Confirms SSM agent is running and network is ready
 
-6. Publisher wizard registers with Netskope
+6. Terraform fetches token locally from SSM Parameter Store
+   └─ aws ssm get-parameter (runs on operator workstation)
+
+7. Terraform sends registration command via SSM Run Command
+   └─ aws ssm send-command → /home/ubuntu/npa_publisher_wizard -token <TOKEN>
+   └─ Waits for command completion and checks status
+
+8. Publisher wizard registers with Netskope
    └─ Token consumed (single-use)
    └─ Outbound TLS connection to NewEdge established
 
-7. Publisher appears as "Connected" in Netskope UI
+9. Publisher appears as "Connected" in Netskope UI
 ```
 
 ### Security Implications
 
-**Token in user data:**
+**Token in SSM Parameter Store:**
 
-The registration token is embedded in EC2 user data (base64 encoded). This means:
-- It is visible in the EC2 Console (Actions → Instance Settings → View User Data)
-- It is accessible via the instance metadata service (IMDS)
-- It is stored in Terraform state
+The registration token is stored as a SecureString in SSM Parameter Store (encrypted at rest with KMS). It is delivered to the instance via SSM Run Command (encrypted channel). This means:
+- The token is **not** visible in EC2 user data or instance metadata
+- The token is encrypted at rest in SSM Parameter Store
+- The token is stored in Terraform state (encrypted with KMS if using remote state)
+- SSM Run Command delivers the token over an encrypted channel
 
 **Mitigations:**
 - **Single-use token**: Once the publisher registers, the token cannot be reused
+- **SSM encrypted delivery**: Token is never embedded in user data or instance metadata
 - **IMDSv2 required**: This project enforces IMDSv2, which requires session tokens and mitigates SSRF attacks
 - **State encryption**: Remote state is encrypted with KMS
 - **No SSH access needed**: Use SSM Session Manager instead of SSH keys
+- **IAM-controlled access**: Only the publisher instance role can read its own token from SSM
 
 **Comparison with CloudFormation approach:**
 
-The CloudFormation version stores the API token in AWS Secrets Manager and delivers the registration token via SSM Run Command (encrypted channel). The Lambda function acts as an intermediary that never exposes the token in user data. This Terraform approach trades that additional security layer for simplicity — no Lambda, no Secrets Manager, no VPC endpoints required.
+The CloudFormation version stores the API token in AWS Secrets Manager and delivers the registration token via SSM Run Command. This Terraform approach now follows a similar pattern — tokens are stored in SSM Parameter Store (SecureString) and delivered via SSM Run Command. The main difference is that Terraform uses a `null_resource` with `local-exec` provisioners to orchestrate the SSM polling and command execution, whereas CloudFormation uses a Lambda function.
 
 ## for_each Pattern
 
@@ -287,15 +298,11 @@ cloudwatch_config_parameter = var.enable_cloudwatch_monitoring ? aws_ssm_paramet
 
 ### Template File
 
-The user data script is in `terraform/templates/userdata.tftpl`:
+The user data script is in `terraform/templates/userdata.tftpl`. It is minimal — publisher registration is handled separately via SSM Run Command after the instance is confirmed online:
 
 ```bash
 #!/bin/bash
 set -e
-
-echo "Starting NPA Publisher registration..."
-/home/ubuntu/npa_publisher_wizard -token ${registration_token}
-echo "NPA Publisher registration complete"
 
 %{ if enable_cloudwatch ~}
 echo "Installing CloudWatch agent..."
@@ -314,17 +321,44 @@ The template is rendered using `templatefile()`:
 
 ```hcl
 user_data = base64encode(templatefile("${path.module}/templates/userdata.tftpl", {
-  registration_token          = netskope_npa_publisher_token.this[each.key].token
   enable_cloudwatch           = var.enable_cloudwatch_monitoring
   cloudwatch_config_parameter = var.enable_cloudwatch_monitoring ? aws_ssm_parameter.cloudwatch_config[0].name : ""
 }))
 ```
 
+### SSM-Based Registration
+
+Publisher registration is handled by `null_resource.publisher_registration` in `ec2_publisher.tf`, which uses two `local-exec` provisioners:
+
+**Step 1 — Wait for SSM readiness:**
+```bash
+# Polls aws ssm describe-instance-information until the instance is "Online"
+# Max 40 attempts × 15s = 10 minutes
+```
+
+**Step 2 — Register via SSM Run Command:**
+```bash
+# Fetches token LOCALLY from SSM Parameter Store (operator workstation)
+TOKEN=$(aws ssm get-parameter --name "/npa/publishers/<name>/registration-token" \
+  --with-decryption --query "Parameter.Value" --output text ...)
+
+# Sends registration command to the instance via SSM Run Command
+aws ssm send-command --instance-ids "<id>" \
+  --document-name "AWS-RunShellScript" \
+  --parameters commands="[\"/home/ubuntu/npa_publisher_wizard -token $TOKEN\"]" ...
+```
+
+This approach is more reliable than user data because:
+- Terraform waits for the instance and network to be fully ready
+- Registration output is captured in SSM command history
+- Failures are visible in the `terraform apply` output
+- No dependency on NAT Gateway timing during cloud-init
+
 ### Template Syntax
 
 | Syntax | Purpose | Example |
 |---|---|---|
-| `${var}` | Variable interpolation | `${registration_token}` |
+| `${var}` | Variable interpolation | `${cloudwatch_config_parameter}` |
 | `%{ if cond ~}` | Conditional block start | `%{ if enable_cloudwatch ~}` |
 | `%{ endif ~}` | Conditional block end | `%{ endif ~}` |
 | `~` | Strip whitespace | Prevents blank lines in output |
@@ -382,6 +416,13 @@ Policies are attached as separate resources (not inline):
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.publisher.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Custom policy — read registration tokens from SSM Parameter Store
+resource "aws_iam_role_policy" "publisher_token_access" {
+  name   = "publisher-token-access"
+  role   = aws_iam_role.publisher.id
+  policy = data.aws_iam_policy_document.publisher_token_access.json
 }
 
 # Conditionally attached — only when monitoring enabled
@@ -461,80 +502,6 @@ The `.terraform-docs.yaml` configures auto-documentation:
 - Sections: requirements, providers, modules, resources, inputs, outputs
 - Includes default values, type information, and descriptions
 
-## Testing with Terratest
-
-### Test Structure
-
-Tests are in the `terraform/tests/` directory using the Go Terratest framework:
-
-```
-terraform/tests/
-├── go.mod                     # Go module definition
-├── examples_basic_test.go     # Test file
-└── README.md                  # Test documentation
-```
-
-### Test Functions
-
-**TestBasicExample** — Full integration test:
-```go
-func TestBasicExample(t *testing.T) {
-    // 1. Check required env vars (TF_VAR_netskope_server_url, etc.)
-    // 2. Configure Terraform options
-    // 3. defer terraform.Destroy (cleanup)
-    // 4. terraform.InitAndApply
-    // 5. Validate outputs (VPC ID, instance IDs, IPs, publisher names)
-}
-```
-
-**TestBasicExamplePlanOnly** — Quick validation:
-```go
-func TestBasicExamplePlanOnly(t *testing.T) {
-    // 1. Configure Terraform with test values
-    // 2. terraform.Init
-    // 3. terraform.Plan (no apply — no real resources created)
-}
-```
-
-### Running Tests
-
-```bash
-cd terraform/tests
-
-# Full test (creates real infrastructure — costs money)
-export TF_VAR_netskope_server_url="https://mytenant.goskope.com/api/v2"
-export TF_VAR_netskope_api_key="your-api-key"
-export TF_VAR_publisher_key_name="your-key-pair"
-go test -v -timeout 30m
-
-# Plan-only test (no infrastructure created)
-go test -v -run TestBasicExamplePlanOnly -timeout 10m
-```
-
-### Environment Variables for Tests
-
-| Variable | Required For | Description |
-|---|---|---|
-| `TF_VAR_netskope_server_url` | Full test | Netskope API URL |
-| `TF_VAR_netskope_api_key` | Full test | Netskope API key |
-| `TF_VAR_publisher_key_name` | Full test | EC2 key pair name |
-
-If any required variable is missing, the full test is skipped with a message.
-
-### CI/CD Integration
-
-```yaml
-# Example GitHub Actions workflow
-- name: Run Terraform Tests
-  env:
-    TF_VAR_netskope_server_url: ${{ secrets.NETSKOPE_SERVER_URL }}
-    TF_VAR_netskope_api_key: ${{ secrets.NETSKOPE_API_KEY }}
-    TF_VAR_publisher_key_name: ${{ secrets.EC2_KEY_NAME }}
-  run: |
-    cd terraform/tests
-    go test -v -timeout 30m
-```
-
 ## Lifecycle Rules
 
 ### ignore_changes
@@ -554,28 +521,27 @@ lifecycle {
 
 **Why ignore user_data changes?**
 - User data changes force instance replacement (destroy + recreate)
-- Token regeneration would trigger user data changes
 - Existing publishers should not be disrupted
 
 ### Intentional Replacement
 
-When you do want to replace an instance (e.g., to apply a new AMI):
+When you do want to replace an instance (e.g., to apply a new AMI), you must also replace the Netskope publisher record and token because registration tokens are single-use:
 
 ```bash
-# Replace a specific instance
-terraform apply -replace='aws_instance.publisher["my-publisher"]'
-
-# This destroys the old instance and creates a new one
-# with the current AMI and fresh user data
+# Replace a specific publisher (all three resources)
+terraform apply \
+  -replace='netskope_npa_publisher.this["my-publisher"]' \
+  -replace='netskope_npa_publisher_token.this["my-publisher"]' \
+  -replace='aws_instance.publisher["my-publisher"]'
 ```
 
 ### When to Use -replace
 
 | Scenario | Command |
 |---|---|
-| Instance is unhealthy | `terraform apply -replace='aws_instance.publisher["name"]'` |
-| Need fresh AMI | `terraform apply -replace='aws_instance.publisher["name"]'` |
-| Need fresh registration | `terraform apply -replace='netskope_npa_publisher.this["name"]'` |
+| Instance is unhealthy | `terraform apply -replace='netskope_npa_publisher.this["name"]' -replace='netskope_npa_publisher_token.this["name"]' -replace='aws_instance.publisher["name"]'` |
+| Need fresh AMI | Same as above (new instance needs new token) |
+| Re-run registration only | `terraform apply -replace='null_resource.publisher_registration["name"]'` |
 | Replace everything | `terraform destroy && terraform apply` |
 
 ## Provider Version Constraints
@@ -594,8 +560,12 @@ terraform {
       version = ">= 5.0"
     }
     netskope = {
-      source  = "netskope/netskope"
-      version = ">= 0.2.0"
+      source  = "netskopeoss/netskope"
+      version = ">= 0.3.3"
+    }
+    null = {
+      source  = "hashicorp/null"
+      version = ">= 3.0"
     }
   }
 }
@@ -627,5 +597,4 @@ terraform init -upgrade
 - [OPERATIONS.md](OPERATIONS.md) — Day-2 operations
 - [Netskope Terraform Provider](https://registry.terraform.io/providers/netskope/netskope/latest/docs)
 - [Terraform for_each Documentation](https://developer.hashicorp.com/terraform/language/meta-arguments/for_each)
-- [Terratest Documentation](https://terratest.gruntwork.io/)
 - [pre-commit-terraform](https://github.com/antonbabenko/pre-commit-terraform)

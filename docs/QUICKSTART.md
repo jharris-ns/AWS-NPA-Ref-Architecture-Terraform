@@ -146,7 +146,9 @@ Review the plan output carefully. You should see resources being created for:
 - Security group
 - IAM role and instance profile
 - Netskope publishers and tokens
+- SSM parameters (registration tokens)
 - EC2 instances
+- Publisher registration (null_resource)
 
 ### Step 4: Apply
 
@@ -207,12 +209,12 @@ Type `yes` when prompted. Terraform will create all resources.
 
 ## Deployment Timeline
 
-Typical deployment time: **5-8 minutes**
+Typical deployment time: **8-15 minutes**
 
 ```
 t=0m    terraform apply starts
         ├─ Netskope publishers created via API
-        ├─ Registration tokens generated
+        ├─ Registration tokens generated and stored in SSM Parameter Store
         └─ VPC resources creation begins (if new VPC)
 
 t=1-2m  VPC resources complete
@@ -224,11 +226,16 @@ t=3-4m  NAT Gateways available
         └─ EC2 instances launching
 
 t=4-5m  EC2 instances running
-        ├─ User data script executes
-        ├─ npa-publisher-wizard registers with Netskope
-        └─ Optional: CloudWatch agent installs
+        ├─ Optional: CloudWatch agent installs via user data
+        └─ Terraform begins polling SSM for instance readiness
 
-t=5-8m  terraform apply complete ✅
+t=5-12m SSM-based publisher registration
+        ├─ Terraform polls SSM until instances appear as "Online"
+        ├─ Registration tokens fetched from SSM Parameter Store
+        ├─ SSM Run Command executes npa_publisher_wizard on each instance
+        └─ Terraform waits for registration to complete
+
+t=8-15m terraform apply complete
         └─ Outputs displayed (instance IDs, IPs, publisher names)
 ```
 
@@ -315,15 +322,9 @@ terraform state list
 # Should return empty
 ```
 
-> **Note**: If you deployed the `terraform/state-infrastructure/` module, destroy it separately:
-> ```bash
-> cd state-infrastructure
-> terraform destroy
-> ```
-
 ## Next Steps
 
-1. **Set up remote state** — For team use, deploy `terraform/state-infrastructure/` and configure the S3 backend. See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md).
+1. **Set up remote state** — For team use, create an S3 backend for state storage and locking. See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md).
 
 2. **Review security** — Understand the security architecture and IAM permissions. See [ARCHITECTURE.md](ARCHITECTURE.md) and [IAM_PERMISSIONS.md](IAM_PERMISSIONS.md).
 

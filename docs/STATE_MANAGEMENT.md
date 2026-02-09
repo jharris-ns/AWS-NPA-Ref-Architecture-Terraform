@@ -7,7 +7,7 @@ Comprehensive guide to managing Terraform state for the NPA Publisher deployment
 - [What is Terraform State?](#what-is-terraform-state)
 - [Local State](#local-state)
 - [Remote State with S3](#remote-state-with-s3)
-- [The state-infrastructure Module](#the-state-infrastructure-module)
+- [Required State Backend Resources](#required-state-backend-resources)
 - [Configuring the S3 Backend](#configuring-the-s3-backend)
 - [Migration: Local to Remote](#migration-local-to-remote)
 - [State Security](#state-security)
@@ -42,12 +42,12 @@ Without state, Terraform cannot:
 Terraform state stores resource attributes in plain text. For this project, state contains:
 
 - **Netskope API key** (from the provider configuration)
-- **Netskope publisher registration tokens** (from `netskope_npa_publisher_token`)
+- **Netskope publisher registration tokens** (from `netskope_npa_publisher_token` and `aws_ssm_parameter.publisher_token`)
 - **EC2 instance metadata** (private IPs, instance IDs)
 - **IAM role ARNs and policy documents**
-- **Security group rules** (including Netskope NewEdge IP ranges)
+- **Security group rules**
 
-> **Warning**: Anyone who can read your state file can see your Netskope API key and registration tokens. Treat state files with the same care as credentials.
+> **Warning**: Anyone who can read your state file can see your Netskope API key and registration tokens. Treat state files with the same care as credentials. Note that tokens are also stored in SSM Parameter Store as SecureStrings (encrypted at rest with KMS).
 
 ## Local State
 
@@ -153,121 +153,71 @@ terraform apply
           └─ Delete lock record
 ```
 
-## The state-infrastructure Module
+## Required State Backend Resources
 
-This project includes a `terraform/state-infrastructure/` directory that creates all the AWS resources needed for remote state.
+To use remote state, you need to create three AWS resources. These can be created via the AWS Console, AWS CLI, CloudFormation, or a separate Terraform configuration.
 
-### What It Creates
+### Resources Needed
 
-| Resource | Name Pattern | Purpose |
+| Resource | Suggested Name Pattern | Purpose |
 |---|---|---|
 | **KMS Key** | `alias/npa-publisher-terraform-state` | Encrypts state file |
 | **S3 Bucket** | `npa-publisher-terraform-state-{ACCOUNT_ID}` | Stores state file |
 | **DynamoDB Table** | `npa-publisher-terraform-lock` | State locking |
 
-### Security Features
+### Recommended Security Settings
 
-The module applies these security controls automatically:
+When creating these resources, apply the following security controls:
 
 - **KMS key rotation** enabled (annual automatic rotation)
 - **S3 public access** blocked (all four block settings enabled)
 - **S3 versioning** enabled (recover previous state versions)
 - **S3 bucket policy** requires HTTPS and restricts access to specified IAM ARNs
 - **KMS key policy** restricts encrypt/decrypt to specified IAM ARNs
+- **DynamoDB** billing mode set to PAY_PER_REQUEST (lock operations are infrequent)
 
-### Step-by-Step Deployment
+### Example: Creating Resources via AWS CLI
 
-**1. Navigate to the state infrastructure directory:**
 ```bash
-cd terraform/state-infrastructure
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGION="us-east-1"
+PROJECT="npa-publisher"
+
+# 1. Create KMS key
+KEY_ID=$(aws kms create-key \
+  --description "Terraform state encryption for ${PROJECT}" \
+  --query KeyMetadata.KeyId --output text)
+aws kms create-alias \
+  --alias-name "alias/${PROJECT}-terraform-state" \
+  --target-key-id "$KEY_ID"
+aws kms enable-key-rotation --key-id "$KEY_ID"
+
+# 2. Create S3 bucket
+BUCKET="${PROJECT}-terraform-state-${ACCOUNT_ID}"
+aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+aws s3api put-bucket-versioning --bucket "$BUCKET" \
+  --versioning-configuration Status=Enabled
+aws s3api put-public-access-block --bucket "$BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+aws s3api put-bucket-encryption --bucket "$BUCKET" \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"'"$KEY_ID"'"},"BucketKeyEnabled":true}]}'
+
+# 3. Create DynamoDB table
+aws dynamodb create-table \
+  --table-name "${PROJECT}-terraform-lock" \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region "$REGION"
+
+# 4. Note the values for backend.tf
+echo "bucket         = \"${BUCKET}\""
+echo "kms_key_id     = \"$(aws kms describe-key --key-id $KEY_ID --query KeyMetadata.Arn --output text)\""
+echo "dynamodb_table = \"${PROJECT}-terraform-lock\""
+echo "region         = \"${REGION}\""
 ```
-
-**2. Initialize Terraform:**
-```bash
-terraform init
-```
-
-**3. Create a variables file:**
-```bash
-cat > terraform.tfvars <<'EOF'
-aws_region   = "us-east-1"
-project_name = "npa-publisher"
-
-# IMPORTANT: Replace with YOUR IAM role/user ARNs
-terraform_admin_role_arns = [
-  "arn:aws:iam::123456789012:role/TerraformAdmin",
-  "arn:aws:iam::123456789012:user/your-username"
-]
-EOF
-```
-
-> **Tip**: Find your current ARN with:
-> ```bash
-> aws sts get-caller-identity --query Arn --output text
-> ```
-
-**4. Review the plan:**
-```bash
-terraform plan
-```
-
-Expected output shows creation of:
-- 1 KMS key + 1 alias
-- 1 S3 bucket + public access block + versioning + encryption config + bucket policy
-- 1 DynamoDB table
-
-**5. Apply:**
-```bash
-terraform apply
-```
-
-Type `yes` when prompted.
-
-**6. Save the outputs:**
-```bash
-terraform output
-```
-
-Example output:
-```
-state_bucket_name  = "npa-publisher-terraform-state-123456789012"
-dynamodb_table_name = "npa-publisher-terraform-lock"
-kms_key_arn        = "arn:aws:kms:us-east-1:123456789012:key/abc123-..."
-kms_key_alias      = "alias/npa-publisher-terraform-state"
-
-backend_config = <<EOT
-  # Copy this to backend.tf in the main project:
-  terraform {
-    backend "s3" {
-      bucket         = "npa-publisher-terraform-state-123456789012"
-      key            = "npa-publishers/terraform.tfstate"
-      region         = "us-east-1"
-      encrypt        = true
-      kms_key_id     = "arn:aws:kms:us-east-1:123456789012:key/abc123-..."
-      dynamodb_table = "npa-publisher-terraform-lock"
-    }
-  }
-EOT
-```
-
-### Variables Reference
-
-| Variable | Type | Default | Description |
-|---|---|---|---|
-| `aws_region` | string | `us-east-1` | AWS region for state infrastructure |
-| `project_name` | string | `npa-publisher` | Prefix for all resource names |
-| `terraform_admin_role_arns` | list(string) | *required* | IAM ARNs allowed to access state |
-
-### Outputs Reference
-
-| Output | Description |
-|---|---|
-| `state_bucket_name` | S3 bucket name — use as `bucket` in backend config |
-| `state_bucket_arn` | S3 bucket ARN — use in IAM policies |
-| `dynamodb_table_name` | DynamoDB table name — use as `dynamodb_table` in backend config |
-| `kms_key_arn` | KMS key ARN — use as `kms_key_id` in backend config |
-| `kms_key_alias` | KMS key alias — human-readable reference |
-| `backend_config` | Ready-to-paste backend configuration block |
 
 ## Configuring the S3 Backend
 
@@ -335,7 +285,7 @@ If you already have local state and want to move to S3, Terraform handles the mi
 
 ### Prerequisites
 
-- State infrastructure deployed (see above)
+- State backend resources created (see [Required State Backend Resources](#required-state-backend-resources))
 - `backend.tf` configured with your values
 - AWS credentials that have access to the S3 bucket, DynamoDB table, and KMS key
 
@@ -411,12 +361,17 @@ terraform init -migrate-state
 
 ### Registration Tokens in State
 
-The Netskope publisher registration tokens are stored in Terraform state:
+The Netskope publisher registration tokens are stored in both Terraform state and SSM Parameter Store:
 
 ```
 netskope_npa_publisher_token.this["my-publisher"]
   ├── publisher_id = "12345"
   └── token        = "eyJhbGciOiJSUz..." (sensitive)
+
+aws_ssm_parameter.publisher_token["my-publisher"]
+  ├── name  = "/npa/publishers/my-publisher/registration-token"
+  ├── type  = "SecureString"
+  └── value = "eyJhbGciOiJSUz..." (encrypted at rest)
 ```
 
 **Mitigations:**
@@ -425,13 +380,15 @@ netskope_npa_publisher_token.this["my-publisher"]
 
 2. **Remote state encryption**: With the S3 backend, state is encrypted at rest with KMS and in transit with HTTPS.
 
-3. **State is not in user data in the CF sense**: Unlike approaches that pass secrets through CloudFormation parameters, the token is embedded in EC2 user data via `templatefile()`. However, user data is visible in EC2 instance metadata and the AWS Console.
+3. **Token not in user data**: Registration tokens are delivered via SSM Run Command (encrypted channel), not embedded in EC2 user data. The token is never visible in EC2 instance metadata or the AWS Console user data view.
 
-4. **IMDSv2 required**: This project requires IMDSv2, which mitigates SSRF attacks that could read instance metadata.
+4. **SSM Parameter Store encryption**: Tokens stored in SSM as SecureStrings are encrypted at rest with KMS.
+
+5. **IMDSv2 required**: This project requires IMDSv2, which mitigates SSRF attacks that could read instance metadata.
 
 ### KMS Encryption
 
-The KMS key created by `terraform/state-infrastructure/` provides:
+The KMS key for state encryption provides:
 
 - **Envelope encryption**: S3 uses a data key derived from your KMS key
 - **Key rotation**: Automatic annual rotation of key material
@@ -709,7 +666,7 @@ terraform state push recovered-state.json
 
 **Automatic (recommended):**
 
-S3 versioning is enabled by default in the state-infrastructure module. Every `terraform apply` creates a new version.
+S3 versioning (when enabled on your state bucket) preserves every version. Every `terraform apply` creates a new version.
 
 **Manual backup:**
 ```bash
@@ -758,7 +715,7 @@ terraform plan
 
 If both state and infrastructure are lost:
 
-1. Deploy state infrastructure: `cd terraform/state-infrastructure && terraform apply`
+1. Create state backend resources (S3 bucket, DynamoDB table, KMS key) — see [Required State Backend Resources](#required-state-backend-resources)
 2. Configure backend in `terraform/backend.tf`
 3. Initialize: `terraform init`
 4. Set variables in `terraform.tfvars` or environment

@@ -56,15 +56,25 @@ aws ec2 describe-images \
 publisher_ami_id = "ami-NEW_AMI_ID"
 ```
 
-**Step 3: Replace instances:**
+**Step 3: Replace publisher, token, and instance:**
+
+A new instance requires a new registration token (tokens are single-use). You must replace the Netskope publisher record, the token, and the EC2 instance together:
+
 ```bash
-# Replace one instance at a time for zero-downtime
-terraform apply -replace='aws_instance.publisher["my-publisher"]'
-# Wait for the new instance to register with Netskope
-terraform apply -replace='aws_instance.publisher["my-publisher-2"]'
+# Replace one publisher at a time for zero-downtime
+terraform apply \
+  -replace='netskope_npa_publisher.this["my-publisher"]' \
+  -replace='netskope_npa_publisher_token.this["my-publisher"]' \
+  -replace='aws_instance.publisher["my-publisher"]'
+
+# Wait for the new instance to register with Netskope, then replace the next
+terraform apply \
+  -replace='netskope_npa_publisher.this["my-publisher-2"]' \
+  -replace='netskope_npa_publisher_token.this["my-publisher-2"]' \
+  -replace='aws_instance.publisher["my-publisher-2"]'
 ```
 
-> **Note**: Because `ignore_changes = [ami, user_data]` is set, changing `publisher_ami_id` alone will not trigger replacement. You must explicitly use `-replace`.
+> **Note**: Because `ignore_changes = [ami, user_data]` is set, changing `publisher_ami_id` alone will not trigger replacement. You must explicitly use `-replace`. Registration tokens are single-use, so the token and Netskope publisher record must also be replaced.
 
 **Step 4: Verify in Netskope UI:**
 - Check **Settings → Security Cloud Platform → Publishers**
@@ -175,28 +185,32 @@ terraform plan
 
 ### Single Instance Replacement
 
-```bash
-# Replace the specific failed instance
-terraform apply -replace='aws_instance.publisher["my-publisher"]'
-```
-
-This will:
-1. Terminate the old EC2 instance
-2. Generate a new registration token (if the Netskope publisher resource is also replaced)
-3. Launch a new EC2 instance with the new token
-4. The new instance auto-registers with Netskope on boot
-
-### Full Publisher Replacement (Including Netskope Record)
-
-If you need to completely re-register the publisher:
+Since registration tokens are single-use, replacing an instance requires replacing the Netskope publisher record, token, and EC2 instance together:
 
 ```bash
-# Replace the Netskope publisher (creates new record + token)
+# Replace the specific failed publisher (all three resources)
 terraform apply \
   -replace='netskope_npa_publisher.this["my-publisher"]' \
   -replace='netskope_npa_publisher_token.this["my-publisher"]' \
   -replace='aws_instance.publisher["my-publisher"]'
 ```
+
+This will:
+1. Terminate the old EC2 instance
+2. Create a new Netskope publisher record and generate a new registration token
+3. Store the new token in SSM Parameter Store
+4. Launch a new EC2 instance
+5. Register the new instance via SSM Run Command (automated by `null_resource.publisher_registration`)
+
+### Re-run Registration Only
+
+If the instance is running but registration failed (e.g., transient network issue), you can re-run just the SSM registration:
+
+```bash
+terraform apply -replace='null_resource.publisher_registration["my-publisher"]'
+```
+
+> **Note**: This only works if the registration token has not already been consumed. If the token was used by a previous failed attempt, you'll need a full publisher replacement (see above).
 
 ### Check Instance Health
 
@@ -222,49 +236,49 @@ aws ssm describe-instance-information \
 
 ## Manual Publisher Registration
 
-If automatic registration via user data fails, you can register manually via SSM Session Manager.
+If automatic registration via SSM Run Command fails, you can register manually.
 
-### Step 1: Connect to the Instance
+### Option A: Re-run SSM Registration via Terraform
+
+The simplest approach is to taint the registration resource and re-apply:
 
 ```bash
-INSTANCE_ID=$(terraform output -json publisher_instance_ids | jq -r '.[0]')
-aws ssm start-session --target "$INSTANCE_ID"
+terraform apply \
+  -replace='null_resource.publisher_registration["my-publisher"]'
 ```
 
-### Step 2: Get the Registration Token
+This will re-run the SSM polling and registration sequence.
 
-The token is available in the Terraform state:
+### Option B: Manual Registration via SSM Session Manager
+
+#### Step 1: Get the Registration Token
+
+The token is available in SSM Parameter Store or Terraform state:
 
 ```bash
-# From your workstation (not the instance)
+# From SSM Parameter Store (preferred)
+aws ssm get-parameter \
+  --name "/npa/publishers/my-publisher/registration-token" \
+  --with-decryption \
+  --query "Parameter.Value" \
+  --output text
+
+# Or from Terraform state
 terraform state show 'netskope_npa_publisher_token.this["my-publisher"]'
 # Look for the "token" attribute
 ```
 
-Or generate a new token via the Netskope API:
+#### Step 2: Connect to the Instance and Register
 
 ```bash
-# Get API token
-NETSKOPE_API_KEY="your-api-key"
-NETSKOPE_URL="https://mytenant.goskope.com/api/v2"
+INSTANCE_ID=$(terraform output -json publisher_instance_ids | jq -r '.[0]')
+aws ssm start-session --target "$INSTANCE_ID"
 
-# Get publisher ID
-PUBLISHER_ID=$(terraform state show 'netskope_npa_publisher.this["my-publisher"]' | grep publisher_id | awk '{print $3}' | tr -d '"')
-
-# Generate new registration token (check provider docs for exact endpoint)
-curl -H "Netskope-Api-Token: $NETSKOPE_API_KEY" \
-  "$NETSKOPE_URL/infrastructure/publishers/$PUBLISHER_ID/registration_token"
-```
-
-### Step 3: Run Registration Wizard
-
-On the instance (via SSM session):
-
-```bash
+# On the instance (via SSM session):
 sudo /home/ubuntu/npa_publisher_wizard -token "YOUR_REGISTRATION_TOKEN"
 ```
 
-### Step 4: Verify
+#### Step 3: Verify
 
 ```bash
 # On the instance
@@ -273,6 +287,8 @@ systemctl status npa_publisher_wizard || systemctl status npa_publisher
 # From the Netskope UI
 # Settings → Security Cloud Platform → Publishers → verify "Connected"
 ```
+
+> **Note**: If the token has already been consumed (single-use), you will need to replace the Netskope publisher record and token to generate a new one. See [Replace a Failed Publisher](#replace-a-failed-publisher).
 
 ## Import Existing Resources
 

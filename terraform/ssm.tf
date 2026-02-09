@@ -17,6 +17,30 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
+# NPA Publisher Registration Tokens
+# ------------------------------------------------------------------------------
+# Stores each publisher's registration token in SSM Parameter Store as a
+# SecureString. The EC2 instance fetches the token at boot via the AWS CLI
+# instead of having it embedded directly in user data.
+#
+# Benefits over embedding tokens in user data:
+#   - Tokens are encrypted at rest with KMS
+#   - Not visible in EC2 instance metadata
+#   - Access controlled via IAM
+#   - Auditable via CloudTrail
+# ------------------------------------------------------------------------------
+resource "aws_ssm_parameter" "publisher_token" {
+  for_each = local.publishers
+
+  name        = "/npa/publishers/${each.value.name}/registration-token"
+  type        = "SecureString"
+  description = "NPA Publisher registration token for ${each.value.name}"
+  value       = netskope_npa_publisher_token.this[each.key].token
+
+  tags = { Name = "${each.value.name}-registration-token" }
+}
+
+# ------------------------------------------------------------------------------
 # CloudWatch Agent Configuration Parameter
 # ------------------------------------------------------------------------------
 # Stores the CloudWatch agent configuration in SSM Parameter Store.

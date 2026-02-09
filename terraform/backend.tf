@@ -19,14 +19,12 @@
 #   - IAM controls who can access state
 #
 # SETUP INSTRUCTIONS:
-#   1. First, deploy the state-infrastructure:
-#      cd state-infrastructure && terraform init && terraform apply
+#   1. Create the required AWS resources (S3 bucket, DynamoDB table, KMS key).
+#      See docs/STATE_MANAGEMENT.md for detailed guidance.
 #
-#   2. Copy the output values (bucket name, KMS key ARN, DynamoDB table)
+#   2. Uncomment the backend block below and fill in the values
 #
-#   3. Uncomment the backend block below and fill in the values
-#
-#   4. Initialize with the new backend:
+#   3. Initialize with the new backend:
 #      terraform init -migrate-state
 #      (This moves local state to S3)
 #
@@ -34,11 +32,11 @@
 # running "terraform init -migrate-state" again.
 # ==============================================================================
 
-# Uncomment and configure after running state-infrastructure/
+# Uncomment and configure after creating your state backend resources
 #
 # terraform {
 #   backend "s3" {
-#     # S3 bucket name (from state-infrastructure output)
+#     # S3 bucket name
 #     bucket = "npa-publisher-terraform-state-ACCOUNT_ID"
 #
 #     # Path within the bucket for this state file
@@ -53,10 +51,10 @@
 #     # Enable server-side encryption
 #     encrypt = true
 #
-#     # KMS key ARN for encryption (from state-infrastructure output)
+#     # KMS key ARN for encryption
 #     kms_key_id = "arn:aws:kms:us-east-1:ACCOUNT_ID:key/KEY_ID"
 #
-#     # DynamoDB table for state locking (from state-infrastructure output)
+#     # DynamoDB table for state locking
 #     dynamodb_table = "npa-publisher-terraform-lock"
 #   }
 # }

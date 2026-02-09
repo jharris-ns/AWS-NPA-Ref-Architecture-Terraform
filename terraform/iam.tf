@@ -103,7 +103,30 @@ resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
 }
 
 # ------------------------------------------------------------------------------
-# SSM Parameter Access Policy (Conditional)
+# SSM Parameter Access Policy: Publisher Registration Tokens
+# ------------------------------------------------------------------------------
+# Allows instances to read their registration tokens from SSM Parameter Store.
+# Uses GetParameter with WithDecryption for SecureString parameters.
+# Scoped to only the /npa/publishers/* path for least privilege.
+# ------------------------------------------------------------------------------
+data "aws_iam_policy_document" "publisher_token_access" {
+  statement {
+    effect  = "Allow"
+    actions = ["ssm:GetParameter"]
+    resources = [
+      for param in aws_ssm_parameter.publisher_token : param.arn
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "publisher_token_access" {
+  name   = "publisher-token-access"
+  role   = aws_iam_role.publisher.id
+  policy = data.aws_iam_policy_document.publisher_token_access.json
+}
+
+# ------------------------------------------------------------------------------
+# SSM Parameter Access Policy: CloudWatch Config (Conditional)
 # ------------------------------------------------------------------------------
 # Custom policy to allow reading the CloudWatch agent configuration from
 # SSM Parameter Store.

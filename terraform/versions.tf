@@ -28,5 +28,11 @@ terraform {
       source  = "netskopeoss/netskope"
       version = ">= 0.3.3"
     }
+
+    # Null provider for SSM-based publisher registration provisioners
+    null = {
+      source  = "hashicorp/null"
+      version = ">= 3.0"
+    }
   }
 }

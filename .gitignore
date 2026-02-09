@@ -37,6 +37,7 @@ override.tf.json
 # ==============================================================================
 # CRITICAL: Never commit these files!
 
+.env
 terraform.tfvars
 terraform.tfvars.json
 *.auto.tfvars
@@ -73,7 +74,7 @@ ehthumbs.db
 Thumbs.db
 
 # ==============================================================================
-# Go (for Terratest)
+# Go
 # ==============================================================================
 
 # Binaries

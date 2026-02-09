@@ -6,7 +6,7 @@
 #
 # Each instance:
 #   - Runs the Netskope Publisher AMI
-#   - Registers with Netskope using the token from netskope.tf
+#   - Is registered with Netskope via SSM Run Command after boot
 #   - Optionally runs CloudWatch agent for monitoring
 #   - Is distributed across availability zones for redundancy
 # ==============================================================================
@@ -29,20 +29,10 @@ resource "aws_instance" "publisher" {
   monitoring             = true                                    # Detailed CloudWatch monitoring
 
   # Distribute instances across subnets (and thus AZs) using modulo
-  # each.value.index % length(...) cycles through the list: 0, 1, 0, 1, ...
-  # This ensures instances are spread across AZs for high availability
   subnet_id = local.private_subnet_ids[each.value.index % length(local.private_subnet_ids)]
 
   # --------------------------------------------------------------------------
   # Instance Metadata Service (IMDS) Configuration
-  # --------------------------------------------------------------------------
-  # IMDS allows instances to retrieve metadata about themselves (instance ID,
-  # IAM credentials, etc.) by querying a special IP address.
-  #
-  # IMDSv2 (http_tokens = "required") is more secure than IMDSv1:
-  #   - Requires a session token for requests
-  #   - Protects against SSRF attacks
-  #   - AWS security best practice
   # --------------------------------------------------------------------------
   metadata_options {
     http_endpoint               = "enabled"  # Enable IMDS
@@ -54,13 +44,6 @@ resource "aws_instance" "publisher" {
   # --------------------------------------------------------------------------
   # Root Volume (Boot Disk)
   # --------------------------------------------------------------------------
-  # The root_block_device is the instance's boot disk.
-  #
-  # gp3 is the latest general-purpose SSD type:
-  #   - Better price/performance than gp2
-  #   - Configurable IOPS and throughput
-  #   - Encrypted for security
-  # --------------------------------------------------------------------------
   root_block_device {
     volume_size = 30    # 30 GB
     volume_type = "gp3" # General purpose SSD (latest generation)
@@ -70,61 +53,159 @@ resource "aws_instance" "publisher" {
   # --------------------------------------------------------------------------
   # User Data (Startup Script)
   # --------------------------------------------------------------------------
-  # User data is a script that runs when the instance first boots.
-  # It's used here to:
-  #   1. Register the publisher with Netskope using the token
-  #   2. Optionally install and configure CloudWatch agent
-  #
-  # base64encode(): User data must be base64-encoded
-  # templatefile(): Reads a template file and substitutes variables
-  #
-  # The template receives:
-  #   - registration_token: Unique token for this publisher
-  #   - enable_cloudwatch: Whether to install CloudWatch agent
-  #   - cloudwatch_config_parameter: SSM parameter name for agent config
+  # Minimal bootstrap — only CloudWatch agent if enabled.
+  # Publisher registration is handled via SSM Run Command (see below).
   # --------------------------------------------------------------------------
   user_data = base64encode(templatefile("${path.module}/templates/userdata.tftpl", {
-    registration_token          = netskope_npa_publisher_token.this[each.key].token
     enable_cloudwatch           = var.enable_cloudwatch_monitoring
     cloudwatch_config_parameter = var.enable_cloudwatch_monitoring ? aws_ssm_parameter.cloudwatch_config[0].name : ""
   }))
 
-  # --------------------------------------------------------------------------
-  # Tags
-  # --------------------------------------------------------------------------
-  # The Name tag is special in AWS - it's displayed in the EC2 console.
-  # Same naming pattern as publishers: first uses base name, others numbered.
-  # --------------------------------------------------------------------------
   tags = {
     Name = each.value.name
   }
 
-  # --------------------------------------------------------------------------
-  # Lifecycle Rules
-  # --------------------------------------------------------------------------
-  # The lifecycle block controls how Terraform handles resource changes.
-  #
-  # ignore_changes tells Terraform to NOT replace the instance if these
-  # attributes change. This is important because:
-  #   - ami: New AMIs are released regularly; we don't want auto-updates
-  #   - user_data: Changes would destroy and recreate the instance
-  #
-  # Without this, changing the AMI or user data would replace all instances!
-  # To update instances intentionally, use a different workflow (e.g., taint).
-  # --------------------------------------------------------------------------
-  # --------------------------------------------------------------------------
-  # Explicit Dependency
-  # --------------------------------------------------------------------------
-  # Ensures EC2 instances are destroyed BEFORE Netskope publisher resources.
-  # The Netskope API will reject publisher deletion if a connected instance
-  # still exists. While the implicit dependency through user_data -> token ->
-  # publisher should handle this, ignore_changes on user_data can cause
-  # Terraform to lose track of that chain. This explicit dependency guarantees
-  # correct destroy ordering.
-  # --------------------------------------------------------------------------
-  depends_on = [netskope_npa_publisher_token.this]
+  depends_on = [
+    netskope_npa_publisher_token.this,
+    aws_nat_gateway.this,
+    aws_route_table_association.private,
+  ]
 
   lifecycle {
     ignore_changes = [ami, user_data]
+  }
+}
+
+# ==============================================================================
+# SSM-Based Publisher Registration
+# ==============================================================================
+# After each EC2 instance launches, Terraform:
+#   1. Polls SSM until the instance appears as "Online" (SSM agent ready)
+#   2. Sends the registration command via SSM Run Command
+#   3. Waits for the command to complete
+#
+# This approach is more reliable than user data because:
+#   - Terraform waits for the instance and network to be fully ready
+#   - Registration output is captured in SSM command history
+#   - Failures are visible in the Terraform apply output
+#   - No dependency on NAT Gateway timing during cloud-init
+# ==============================================================================
+
+resource "null_resource" "publisher_registration" {
+  for_each = local.publishers
+
+  triggers = {
+    instance_id = aws_instance.publisher[each.key].id
+    token_param = aws_ssm_parameter.publisher_token[each.key].name
+  }
+
+  # --------------------------------------------------------------------------
+  # Step 1: Wait for Instance to be SSM-Managed
+  # --------------------------------------------------------------------------
+  # Polls aws ssm describe-instance-information until the instance shows
+  # as "Online". This confirms the SSM agent is running and the instance
+  # has network connectivity.
+  # --------------------------------------------------------------------------
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "Waiting for instance ${aws_instance.publisher[each.key].id} to be SSM-managed..."
+      MAX_ATTEMPTS=40
+      ATTEMPT=0
+      while true; do
+        ATTEMPT=$((ATTEMPT + 1))
+        STATUS=$(aws ssm describe-instance-information \
+          --filters "Key=InstanceIds,Values=${aws_instance.publisher[each.key].id}" \
+          --query "InstanceInformationList[0].PingStatus" \
+          --output text \
+          --region ${var.aws_region} \
+          --profile ${var.aws_profile != "" ? var.aws_profile : "default"} 2>/dev/null || echo "None")
+
+        if [ "$STATUS" = "Online" ]; then
+          echo "Instance ${aws_instance.publisher[each.key].id} is SSM-managed and Online"
+          break
+        fi
+
+        if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+          echo "ERROR: Instance ${aws_instance.publisher[each.key].id} not SSM-managed after $MAX_ATTEMPTS attempts"
+          exit 1
+        fi
+
+        echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS - Status: $STATUS - waiting 15s..."
+        sleep 15
+      done
+    EOT
+  }
+
+  # --------------------------------------------------------------------------
+  # Step 2: Register Publisher via SSM Run Command
+  # --------------------------------------------------------------------------
+  # Fetches the token locally from SSM Parameter Store, then passes it
+  # directly to the instance via SSM Run Command. This avoids requiring
+  # the AWS CLI on the publisher AMI.
+  # --------------------------------------------------------------------------
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "Fetching registration token from SSM Parameter Store..."
+      TOKEN=$(aws ssm get-parameter \
+        --name "${aws_ssm_parameter.publisher_token[each.key].name}" \
+        --with-decryption \
+        --query "Parameter.Value" \
+        --output text \
+        --region ${var.aws_region} \
+        --profile ${var.aws_profile != "" ? var.aws_profile : "default"})
+
+      echo "Registering publisher ${each.value.name} via SSM Run Command..."
+      COMMAND_ID=$(aws ssm send-command \
+        --instance-ids "${aws_instance.publisher[each.key].id}" \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="[\"/home/ubuntu/npa_publisher_wizard -token $TOKEN\"]" \
+        --timeout-seconds 300 \
+        --region ${var.aws_region} \
+        --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
+        --query "Command.CommandId" \
+        --output text)
+
+      echo "SSM Command ID: $COMMAND_ID"
+      echo "Waiting for registration to complete..."
+
+      aws ssm wait command-executed \
+        --command-id "$COMMAND_ID" \
+        --instance-id "${aws_instance.publisher[each.key].id}" \
+        --region ${var.aws_region} \
+        --profile ${var.aws_profile != "" ? var.aws_profile : "default"} 2>/dev/null || true
+
+      STATUS=$(aws ssm get-command-invocation \
+        --command-id "$COMMAND_ID" \
+        --instance-id "${aws_instance.publisher[each.key].id}" \
+        --region ${var.aws_region} \
+        --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
+        --query "Status" \
+        --output text)
+
+      OUTPUT=$(aws ssm get-command-invocation \
+        --command-id "$COMMAND_ID" \
+        --instance-id "${aws_instance.publisher[each.key].id}" \
+        --region ${var.aws_region} \
+        --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
+        --query "StandardOutputContent" \
+        --output text)
+
+      echo "Registration output: $OUTPUT"
+
+      if [ "$STATUS" != "Success" ]; then
+        ERROR=$(aws ssm get-command-invocation \
+          --command-id "$COMMAND_ID" \
+          --instance-id "${aws_instance.publisher[each.key].id}" \
+          --region ${var.aws_region} \
+          --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
+          --query "StandardErrorContent" \
+          --output text)
+        echo "ERROR: Registration failed with status $STATUS"
+        echo "Error output: $ERROR"
+        exit 1
+      fi
+
+      echo "Publisher ${each.value.name} registered successfully"
+    EOT
   }
 }

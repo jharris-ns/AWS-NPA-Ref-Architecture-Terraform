@@ -6,7 +6,6 @@ IAM permissions required to deploy and manage the NPA Publisher Terraform config
 
 - [Overview](#overview)
 - [Terraform Operator Permissions](#terraform-operator-permissions)
-- [State Infrastructure Permissions](#state-infrastructure-permissions)
 - [Create a Dedicated Deployment Role](#create-a-dedicated-deployment-role)
 - [CI/CD Pipeline Permissions](#cicd-pipeline-permissions)
 - [Security Best Practices](#security-best-practices)
@@ -15,12 +14,7 @@ IAM permissions required to deploy and manage the NPA Publisher Terraform config
 
 ## Overview
 
-This project requires IAM permissions for two categories of operations:
-
-1. **Terraform Operator** — The IAM principal running `terraform apply` to create NPA infrastructure
-2. **State Infrastructure Admin** — The IAM principal creating the S3/DynamoDB/KMS state backend (if using remote state)
-
-These can be the same principal, but separating them follows the principle of least privilege.
+The Terraform operator needs IAM permissions to create and manage NPA infrastructure. If using remote state with S3, the operator also needs access to the state backend resources (S3, DynamoDB, KMS).
 
 ## Terraform Operator Permissions
 
@@ -150,6 +144,16 @@ The minimum IAM policy for deploying the NPA Publisher infrastructure.
       "Resource": "*"
     },
     {
+      "Sid": "SSMRunCommand",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "SSMSessionManager",
       "Effect": "Allow",
       "Action": [
@@ -235,88 +239,11 @@ The minimum IAM policy for deploying the NPA Publisher infrastructure.
 | **VPC** | Create/Delete VPC, Subnets, NAT, IGW, Routes, VPC Endpoints | Network infrastructure |
 | **Security Groups** | Create/Delete, Authorize/Revoke rules | Firewall management |
 | **IAM** | Create/Delete roles, profiles, attach policies | Instance role management |
-| **SSM** | PutParameter, StartSession | CloudWatch config, shell access |
+| **SSM** | PutParameter, GetParameter, SendCommand, StartSession | Token storage, publisher registration, shell access |
 | **CloudWatch** | Log groups, alarms | Monitoring |
 | **S3** | GetObject, PutObject | Terraform state (if remote) |
 | **DynamoDB** | GetItem, PutItem, DeleteItem | State locking (if remote) |
 | **KMS** | Encrypt, Decrypt, GenerateDataKey | State encryption (if remote) |
-
-## State Infrastructure Permissions
-
-If deploying the `terraform/state-infrastructure/` module, you need additional permissions:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "S3BucketAdmin",
-      "Effect": "Allow",
-      "Action": [
-        "s3:CreateBucket",
-        "s3:DeleteBucket",
-        "s3:PutBucketVersioning",
-        "s3:GetBucketVersioning",
-        "s3:PutBucketPolicy",
-        "s3:GetBucketPolicy",
-        "s3:DeleteBucketPolicy",
-        "s3:PutEncryptionConfiguration",
-        "s3:GetEncryptionConfiguration",
-        "s3:PutBucketPublicAccessBlock",
-        "s3:GetBucketPublicAccessBlock",
-        "s3:PutBucketTagging",
-        "s3:GetBucketTagging",
-        "s3:ListBucket",
-        "s3:GetBucketLocation"
-      ],
-      "Resource": "arn:aws:s3:::*-terraform-state-*"
-    },
-    {
-      "Sid": "DynamoDBAdmin",
-      "Effect": "Allow",
-      "Action": [
-        "dynamodb:CreateTable",
-        "dynamodb:DeleteTable",
-        "dynamodb:DescribeTable",
-        "dynamodb:DescribeContinuousBackups",
-        "dynamodb:DescribeTimeToLive",
-        "dynamodb:ListTagsOfResource",
-        "dynamodb:TagResource",
-        "dynamodb:UntagResource"
-      ],
-      "Resource": "arn:aws:dynamodb:*:*:table/*-terraform-lock"
-    },
-    {
-      "Sid": "KMSAdmin",
-      "Effect": "Allow",
-      "Action": [
-        "kms:CreateKey",
-        "kms:ScheduleKeyDeletion",
-        "kms:DescribeKey",
-        "kms:GetKeyPolicy",
-        "kms:GetKeyRotationStatus",
-        "kms:ListResourceTags",
-        "kms:PutKeyPolicy",
-        "kms:EnableKeyRotation",
-        "kms:CreateAlias",
-        "kms:DeleteAlias",
-        "kms:ListAliases",
-        "kms:TagResource",
-        "kms:UntagResource"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "STSIdentity",
-      "Effect": "Allow",
-      "Action": [
-        "sts:GetCallerIdentity"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
 
 ## Create a Dedicated Deployment Role
 

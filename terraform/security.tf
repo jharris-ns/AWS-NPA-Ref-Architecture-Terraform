@@ -91,61 +91,21 @@ resource "aws_security_group" "publisher" {
   }
 
   # --------------------------------------------------------------------------
-  # Netskope NewEdge Data Center IPs
+  # Internet Egress (All Traffic)
   # --------------------------------------------------------------------------
-  # These are Netskope's data center IP ranges that publishers connect to.
-  # Publishers establish outbound TLS connections to these IPs.
+  # Publishers need outbound access for:
+  #   - Netskope cloud registration and tunnel establishment
+  #   - Netskope NewEdge data center connections
+  #   - OS and Docker package updates
+  #   - DNS resolution
   #
-  # Note: This list may need updates as Netskope expands infrastructure.
-  # Check Netskope documentation for the latest IP ranges.
+  # TODO: For production, consider restricting to specific ports/CIDRs.
   # --------------------------------------------------------------------------
   egress {
-    description = "Netskope NewEdge DC"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = [
-      "8.36.116.0/24",
-      "8.39.144.0/24",
-      "31.186.239.0/24",
-      "163.116.128.0/17",
-      "162.10.0.0/17"
-    ]
-  }
-
-  # --------------------------------------------------------------------------
-  # HTTPS Egress (Temporary Broad Rule)
-  # --------------------------------------------------------------------------
-  # This allows HTTPS to any IP - it's intentionally broad.
-  #
-  # TODO: For production, consider restricting this to only the specific
-  # Netskope NPA registration endpoints. Contact Netskope support for the
-  # complete list of IPs that need to be whitelisted.
-  #
-  # Why 0.0.0.0/0? Publishers need to reach:
-  #   - Netskope tenant URLs (dynamic IPs behind CDN/load balancers)
-  #   - Registration endpoints
-  #   - Software update servers
-  # --------------------------------------------------------------------------
-  egress {
-    description = "HTTPS - pending complete Netskope IP ranges"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # --------------------------------------------------------------------------
-  # DNS
-  # --------------------------------------------------------------------------
-  # Allows DNS queries (UDP port 53) to any DNS server.
-  # Required for the publisher to resolve hostnames.
-  # --------------------------------------------------------------------------
-  egress {
-    description = "DNS"
-    from_port   = 53
-    to_port     = 53
-    protocol    = "udp"
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 

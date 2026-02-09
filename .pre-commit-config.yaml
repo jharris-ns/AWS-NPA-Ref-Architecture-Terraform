@@ -117,8 +117,7 @@ exclude: |
     \.terraform/.*|
     \.terraform\.lock\.hcl|
     terraform/\.terraform/.*|
-    terraform/\.terraform\.lock\.hcl|
-    terraform/state-infrastructure/\.terraform/.*
+    terraform/\.terraform\.lock\.hcl
   )$
 
 # Run hooks in parallel for speed

@@ -39,14 +39,6 @@ provider "aws" {
   profile = var.aws_profile != "" ? var.aws_profile : null
 
   default_tags {
-    tags = merge(
-      {
-        Project     = var.project
-        Environment = var.environment
-        CostCenter  = var.cost_center
-        ManagedBy   = "Terraform"
-      },
-      var.additional_tags
-    )
+    tags = var.tags
   }
 }

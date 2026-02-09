@@ -91,9 +91,9 @@ Comprehensive architecture documentation for the Netskope Private Access (NPA) P
 
 | Aspect | CloudFormation | Terraform |
 |---|---|---|
-| **Publisher Registration** | Lambda + SSM Run Command | Netskope Terraform provider + user data script |
-| **Secrets Management** | AWS Secrets Manager | Terraform state (encrypted with KMS) |
-| **Token Delivery** | SSM encrypted channel | EC2 user data (base64 encoded) |
+| **Publisher Registration** | Lambda + SSM Run Command | Netskope Terraform provider + SSM Run Command |
+| **Secrets Management** | AWS Secrets Manager | SSM Parameter Store (SecureString) + Terraform state (encrypted with KMS) |
+| **Token Delivery** | SSM encrypted channel | SSM Parameter Store → local fetch → SSM Run Command |
 | **Orchestration** | CloudFormation engine | Terraform CLI (operator workstation or CI/CD) |
 | **State Storage** | CloudFormation service (managed) | S3 + DynamoDB (self-managed) |
 | **VPC Endpoints** | SSM endpoints (required for Lambda→SSM) | SSM endpoints (ssm, ssmmessages, ec2messages) |
@@ -143,16 +143,12 @@ Comprehensive architecture documentation for the Netskope Private Access (NPA) P
 - **IMDS**: v2 required (session tokens for SSRF protection)
 - **Storage**: 30 GB gp3 encrypted root volume
 - **Monitoring**: Detailed CloudWatch monitoring enabled
-- **User Data**: Registration script with Netskope token
+- **User Data**: Minimal (CloudWatch agent only if enabled); registration via SSM Run Command
 
 #### 6. Security Groups
 - **Ingress**: None — publishers only initiate outbound connections
-- **Egress**:
-  - VPC internal traffic (all protocols)
-  - RFC1918 private ranges (peered VPCs, on-premises)
-  - Netskope NewEdge IPs on port 443
-  - HTTPS (443) to 0.0.0.0/0 (registration and updates)
-  - DNS (UDP 53) to 0.0.0.0/0
+- **Egress**: All outbound traffic allowed (0.0.0.0/0, all ports and protocols)
+  - Publishers require connectivity to Netskope NewEdge, DNS, package repositories, and internal applications
 
 #### 7. Netskope Terraform Provider
 - **Purpose**: Creates and manages publisher records in Netskope tenant
@@ -200,8 +196,8 @@ NPA Publisher → VPC Endpoint (Interface) →
 AWS Systems Manager Service Endpoints
 ```
 - **Port**: HTTPS (443)
-- **Purpose**: SSM agent communication, Session Manager access
-- **Note**: SSM traffic uses Interface VPC endpoints (`ssm`, `ssmmessages`, `ec2messages`), keeping traffic within the AWS network without routing through the NAT Gateway.
+- **Purpose**: SSM agent communication, Session Manager access, publisher registration via SSM Run Command
+- **Note**: SSM traffic uses Interface VPC endpoints (`ssm`, `ssmmessages`, `ec2messages`), keeping traffic within the AWS network without routing through the NAT Gateway. Publisher registration is delivered via SSM Run Command after the instance is confirmed online.
 
 #### 4. Terraform Operator to AWS / Netskope APIs
 ```
@@ -241,21 +237,10 @@ Ingress Rules: NONE
   - Publishers never accept inbound connections
   - Zero attack surface from internet
 
-Egress Rules (Restrictive):
-  1. All traffic → VPC CIDR
-     Purpose: Internal application connectivity
-
-  2. All traffic → RFC1918 ranges
-     Purpose: Peered VPCs and on-premises networks
-
-  3. HTTPS (443) → Netskope NewEdge IPs (5 CIDR blocks)
-     Purpose: Publisher management and tunneling
-
-  4. HTTPS (443) → 0.0.0.0/0
-     Purpose: Registration and updates (pending IP restriction)
-
-  5. DNS (UDP 53) → 0.0.0.0/0
-     Purpose: Hostname resolution
+Egress Rules:
+  1. All traffic → 0.0.0.0/0
+     Purpose: Outbound connectivity for Netskope NewEdge, DNS,
+              package repositories, and internal applications
 ```
 
 #### Layer 2: IAM Least Privilege
@@ -264,6 +249,7 @@ Egress Rules (Restrictive):
 ```yaml
 Permissions:
   - AmazonSSMManagedInstanceCore          # SSM agent communication
+  - ssm:GetParameter (custom policy)      # Publisher registration tokens
   - CloudWatchAgentServerPolicy           # CloudWatch agent (conditional)
   - ssm:GetParameter (custom policy)      # CloudWatch config (conditional)
 
@@ -292,7 +278,7 @@ Restrictions:
 - Publisher registration tokens (single-use)
 - EC2 instance metadata, IAM configurations
 
-> **Comparison with CloudFormation**: The CF version uses AWS Secrets Manager to store the API token and delivers registration tokens via encrypted SSM channels. In this Terraform version, the API key is in the provider configuration (and thus in state), and registration tokens are embedded in EC2 user data. The S3+KMS backend provides encryption at rest, but operators should understand this difference.
+> **Comparison with CloudFormation**: The CF version uses AWS Secrets Manager to store the API token and delivers registration tokens via SSM Run Command. This Terraform version follows a similar pattern — registration tokens are stored in SSM Parameter Store (SecureString) and delivered via SSM Run Command. The API key is in the provider configuration (and thus in state). The S3+KMS backend provides encryption at rest.
 
 See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for comprehensive state security guidance.
 
@@ -476,7 +462,6 @@ publisher_instance_type = "t3.xlarge"
 - Infrastructure as Code (Terraform)
 - Pre-commit hooks for quality gates
 - Automated documentation generation
-- Terratest for infrastructure testing
 - Terraform plan as drift detection
 
 ## Deployment Flow
@@ -515,15 +500,21 @@ publisher_instance_type = "t3.xlarge"
    ├─ netskope_npa_publisher.this (for_each: create publishers)
    └─ netskope_npa_publisher_token.this (for_each: generate tokens)
 
-7. SSM Resources (if enable_cloudwatch_monitoring = true)
-   └─ aws_ssm_parameter.cloudwatch_config
+7. SSM Resources
+   ├─ aws_ssm_parameter.publisher_token (for_each: store registration tokens)
+   └─ aws_ssm_parameter.cloudwatch_config (if enable_cloudwatch_monitoring = true)
 
 8. EC2 Instances
-   └─ aws_instance.publisher (for_each: launch with user data)
-       ├─ User data registers publisher with Netskope token
-       └─ Optional: CloudWatch agent installation
+   └─ aws_instance.publisher (for_each: launch instances)
+       └─ Optional: CloudWatch agent installation via user data
 
-Total Deployment Time: ~5-8 minutes
+9. Publisher Registration (null_resource.publisher_registration)
+   └─ for_each: poll SSM until instance is Online
+       ├─ Fetch token locally from SSM Parameter Store
+       ├─ Send registration command via SSM Run Command
+       └─ Wait for registration to complete
+
+Total Deployment Time: ~8-15 minutes (includes SSM polling)
 ```
 
 ### Terraform Destroy Sequence
@@ -572,7 +563,10 @@ aws_security_group.publisher ─┐
 aws_iam_instance_profile.publisher ─┤
 local.private_subnet_ids ─┤
 netskope_npa_publisher_token.this ─┤
-                                    └─► aws_instance.publisher
+aws_nat_gateway.this ─┤
+                       └─► aws_instance.publisher
+                             └─► null_resource.publisher_registration
+                                   (polls SSM → fetches token → SSM Run Command)
 ```
 
 ### External Dependencies

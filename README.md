@@ -15,7 +15,7 @@ This project includes comprehensive documentation for deployment, operations, an
 - **[DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)** — Complete deployment instructions with all configuration options and multiple deployment paths
 - **[STATE_MANAGEMENT.md](docs/STATE_MANAGEMENT.md)** — Terraform state management: local vs. remote, S3 backend setup, migration, security, and disaster recovery
 - **[IAM_PERMISSIONS.md](docs/IAM_PERMISSIONS.md)** — Required IAM permissions for the Terraform operator, with full policy JSON and CI/CD examples
-- **[DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)** — Technical deep-dive into Terraform patterns, provider internals, `for_each`, user data, pre-commit hooks, and Terratest
+- **[DEVOPS-NOTES.md](docs/DEVOPS-NOTES.md)** — Technical deep-dive into Terraform patterns, provider internals, `for_each`, user data, and pre-commit hooks
 - **[OPERATIONS.md](docs/OPERATIONS.md)** — Day-2 operational procedures: upgrades, scaling, rotation, replacement, and monitoring
 - **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — Common issues and solutions with diagnostic commands
 
@@ -238,18 +238,6 @@ AWS-NPA-Ref-Architecture-Terraform/
 │   ├── templates/
 │   │   └── userdata.tftpl           # EC2 user data template (registration + CloudWatch)
 │   │
-│   ├── state-infrastructure/        # Separate module for S3/DynamoDB/KMS state backend
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   │
-│   ├── examples/
-│   │   └── basic/                   # Basic usage example
-│   │       ├── main.tf
-│   │       ├── variables.tf
-│   │       ├── outputs.tf
-│   │       └── terraform.tfvars.example
-│   │
 │
 ├── .pre-commit-config.yaml          # Pre-commit hooks (fmt, validate, tfsec, checkov)
 ├── .terraform-docs.yaml             # terraform-docs configuration
@@ -267,12 +255,12 @@ Approximate monthly costs for us-east-1 region (2 publishers, new VPC):
 | NAT Gateway x2 | ~$64 + data transfer |
 | VPC Endpoints x3 (SSM) | ~$22 |
 | EBS gp3 30GB x2 | ~$5 |
-| State backend (S3 + DynamoDB + KMS) | ~$1 |
+| State backend (S3 + DynamoDB + KMS)* | ~$1 |
 | CloudWatch custom metrics (optional) | ~$5 |
 | **Total (new VPC)** | **~$212/month** |
 | **Total (existing VPC)** | **~$125/month** |
 
-*Costs vary by region, instance type, and data transfer volume.*
+*Costs vary by region, instance type, and data transfer volume. \*State backend costs apply only if using remote state (see [STATE_MANAGEMENT.md](docs/STATE_MANAGEMENT.md)).*
 
 > Compared to the CloudFormation reference architecture, this Terraform deployment costs less because it does not require Lambda functions or Secrets Manager.
 

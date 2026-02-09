@@ -9,7 +9,6 @@ Detailed deployment instructions for the Netskope NPA Publisher Terraform config
 - [Path A: Local State + New VPC](#path-a-local-state--new-vpc)
 - [Path B: Remote State + New VPC](#path-b-remote-state--new-vpc)
 - [Path C: Existing VPC](#path-c-existing-vpc)
-- [Path D: Module Usage](#path-d-module-usage)
 - [Configuring Variables](#configuring-variables)
 - [Reviewing the Plan](#reviewing-the-plan)
 - [Applying the Configuration](#applying-the-configuration)
@@ -24,7 +23,6 @@ Detailed deployment instructions for the Netskope NPA Publisher Terraform config
 |---|---|---|
 | Terraform | >= 1.0 | `terraform version` |
 | AWS CLI | v2 | `aws --version` |
-| Go (for tests only) | >= 1.21 | `go version` |
 | pre-commit (optional) | any | `pre-commit --version` |
 
 ### AWS Requirements
@@ -50,7 +48,6 @@ Choose the path that matches your situation:
 | **A** | Local | New | Quick start, solo developer, learning |
 | **B** | Remote (S3) | New | Teams, production, CI/CD |
 | **C** | Either | Existing | Integration with existing infrastructure |
-| **D** | Either | Module | Reusable, composable deployments |
 
 ## Path A: Local State + New VPC
 
@@ -107,42 +104,13 @@ terraform output
 
 The recommended path for teams and production deployments.
 
-### Step 1: Deploy State Infrastructure
+### Step 1: Create State Backend Resources
 
-```bash
-cd state-infrastructure
-
-terraform init
-```
-
-Create `terraform.tfvars`:
-```hcl
-aws_region   = "us-east-1"
-project_name = "npa-publisher"
-
-terraform_admin_role_arns = [
-  "arn:aws:iam::123456789012:role/TerraformAdmin"
-]
-```
-
-> **Tip**: Get your ARN with `aws sts get-caller-identity --query Arn --output text`
-
-```bash
-terraform plan
-terraform apply
-
-# Save the outputs — you'll need them for the backend configuration
-terraform output
-```
+Before configuring the backend, create the required AWS resources (S3 bucket, DynamoDB table, KMS key) using your preferred method (AWS Console, CLI, or CloudFormation). See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for detailed guidance on what resources are needed and their recommended configuration.
 
 ### Step 2: Configure the Backend
 
-Return to the main project directory:
-```bash
-cd ..
-```
-
-Edit `terraform/backend.tf` — uncomment the backend block and fill in values from the state-infrastructure outputs:
+Edit `terraform/backend.tf` — uncomment the backend block and fill in values from your state backend resources:
 
 ```hcl
 terraform {
@@ -251,56 +219,6 @@ terraform apply
 ```
 
 > **Note**: When using an existing VPC, Terraform only creates the security group, IAM resources, Netskope publishers, and EC2 instances. VPC resources are not managed.
-
-## Path D: Module Usage
-
-Use the project as a Terraform module from the `terraform/examples/basic/` directory or your own configuration.
-
-### Step 1: Create Module Configuration
-
-```hcl
-# main.tf
-module "npa_publisher" {
-  source = "../../"  # Or git URL / registry path
-
-  # Required
-  netskope_server_url = var.netskope_server_url
-  netskope_api_key    = var.netskope_api_key
-  publisher_name      = var.publisher_name
-  publisher_key_name  = var.publisher_key_name
-
-  # Optional
-  aws_region                   = "us-east-1"
-  publisher_count              = 2
-  publisher_instance_type      = "t3.large"
-  enable_cloudwatch_monitoring = false
-
-  # VPC
-  create_vpc = true
-  vpc_cidr   = "10.0.0.0/16"
-}
-
-# Outputs
-output "publisher_instance_ids" {
-  value = module.npa_publisher.publisher_instance_ids
-}
-
-output "publisher_names" {
-  value = module.npa_publisher.publisher_names
-}
-```
-
-### Step 2: Deploy
-
-```bash
-cd terraform/examples/basic  # Or your module directory
-
-terraform init
-terraform plan
-terraform apply
-```
-
-See `terraform/examples/basic/` for a complete working example.
 
 ## Configuring Variables
 
@@ -485,17 +403,6 @@ This removes all resources managed by Terraform:
 - Security groups
 - IAM roles and profiles
 - VPC resources (if created by this deployment)
-
-### Destroy State Infrastructure (Optional)
-
-If you deployed the `terraform/state-infrastructure/` module and no longer need it:
-
-```bash
-cd terraform/state-infrastructure
-terraform destroy
-```
-
-> **Warning**: Destroying state infrastructure deletes the S3 bucket containing Terraform state. Only do this after the main infrastructure is destroyed.
 
 ### Verify Cleanup
 

@@ -174,39 +174,15 @@ variable "enable_cloudwatch_monitoring" {
 #   - Resource organization and filtering
 #   - Automation and policy enforcement
 #   - Identifying resource ownership
+#
+# These tags are applied to ALL AWS resources via provider default_tags.
+# Per-resource Name tags merge with these and take precedence on conflict.
 # ==============================================================================
 
-variable "cost_center" {
-  description = "Cost center for billing allocation"
-  type        = string
-  default     = "IT-Operations"
-}
-
-variable "project" {
-  description = "Project name for resource tracking"
-  type        = string
-  default     = "NPA-Publisher"
-}
-
-variable "environment" {
-  description = "Environment type"
-  type        = string
-  default     = "Production"
-
-  # Restrict to predefined environment types
-  validation {
-    condition     = contains(["Production", "Staging", "Development", "Test"], var.environment)
-    error_message = "Environment must be one of: Production, Staging, Development, Test."
+variable "tags" {
+  description = "Common tags applied to all AWS resources via provider default_tags"
+  type        = map(string)
+  default = {
+    ManagedBy = "Terraform"
   }
-}
-
-variable "additional_tags" {
-  description = "Additional tags to apply to all resources"
-  type        = map(string) # Map type: key-value pairs where both are strings
-  default     = {}          # Empty map as default
-  # Usage in tfvars:
-  # additional_tags = {
-  #   Owner = "security-team"
-  #   CostCode = "12345"
-  # }
 }
