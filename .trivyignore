@@ -1,0 +1,15 @@
+# ==============================================================================
+# Trivy Ignore Rules
+# ==============================================================================
+# These findings are intentional or not applicable to this project.
+# See: https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/
+
+# Unrestricted egress — intentional for publisher connectivity
+# Publishers require outbound access to Netskope NewEdge, DNS, and internal apps
+AVD-AWS-0104
+
+# Public subnet auto-assign IPs — these subnets only host NAT Gateways
+AVD-AWS-0164
+
+# VPC flow logging — optional hardening, not required for this deployment
+AVD-AWS-0178

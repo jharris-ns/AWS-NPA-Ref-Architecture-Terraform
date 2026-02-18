@@ -138,4 +138,3 @@ rule "aws_iam_policy_document_gov_friendly_arns" {
 rule "aws_security_group_invalid_protocol" {
   enabled = true
 }
-

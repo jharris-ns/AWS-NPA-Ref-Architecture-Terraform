@@ -1,6 +1,6 @@
 # Architecture Overview
 
-Comprehensive architecture documentation for the Netskope Private Access (NPA) Publisher deployment on AWS using Terraform.
+AWS reference architecture for deploying Netskope Private Access (NPA) Publishers using Terraform. This document explains each design decision through the lens of AWS best practices and the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 ## Table of Contents
 
@@ -9,9 +9,7 @@ Comprehensive architecture documentation for the Netskope Private Access (NPA) P
 - [Network Architecture](#network-architecture)
 - [Security Architecture](#security-architecture)
 - [High Availability Design](#high-availability-design)
-- [AWS Well-Architected Alignment](#aws-well-architected-alignment)
-- [Deployment Flow](#deployment-flow)
-- [Resource Dependencies](#resource-dependencies)
+- [Additional Resources](#additional-resources)
 
 ## Architecture Diagram
 
@@ -87,83 +85,73 @@ Comprehensive architecture documentation for the Netskope Private Access (NPA) P
                  └───────────────────────────────┘
 ```
 
-### Key Differences from CloudFormation Architecture
-
-| Aspect | CloudFormation | Terraform |
-|---|---|---|
-| **Publisher Registration** | Lambda + SSM Run Command | Netskope Terraform provider + SSM Run Command |
-| **Secrets Management** | AWS Secrets Manager | SSM Parameter Store (SecureString) + Terraform state (encrypted with KMS) |
-| **Token Delivery** | SSM encrypted channel | SSM Parameter Store → local fetch → SSM Run Command |
-| **Orchestration** | CloudFormation engine | Terraform CLI (operator workstation or CI/CD) |
-| **State Storage** | CloudFormation service (managed) | S3 + DynamoDB (self-managed) |
-| **VPC Endpoints** | SSM endpoints (required for Lambda→SSM) | SSM endpoints (ssm, ssmmessages, ec2messages) |
-
 ## Component Overview
 
-### Core Infrastructure Components
+### VPC and Subnet Design
 
-#### 1. VPC (Virtual Private Cloud)
-- **Purpose**: Isolated network environment for NPA Publishers
-- **CIDR**: 10.0.0.0/16 (default, configurable)
-- **DNS**: Enabled for hostname resolution
-- **Features**:
-  - Multi-AZ design for high availability
-  - Public and private subnet segregation
-  - Redundant internet connectivity via NAT Gateways
-- **Conditional**: Only created when `create_vpc = true`
+**AWS best practice**: Place workloads in private subnets unless they require direct inbound internet access ([VPC User Guide — VPC with public and private subnets](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Scenario2.html)).
 
-#### 2. Subnets
-- **Public Subnets** (10.0.1.0/24, 10.0.3.0/24):
-  - Host NAT Gateways for outbound internet access
-  - Route table: 0.0.0.0/0 → Internet Gateway
+- **VPC** (10.0.0.0/16, configurable): Isolated network environment with DNS support enabled. Only created when `create_vpc = true`; an existing VPC can be supplied instead.
+- **Private Subnets** (10.0.2.0/24, 10.0.4.0/24): Host NPA Publisher EC2 instances. No public IP addresses. Egress via NAT Gateway.
+- **Public Subnets** (10.0.1.0/24, 10.0.3.0/24): Host NAT Gateways only — no compute resources. Route to internet via Internet Gateway.
 
-- **Private Subnets** (10.0.2.0/24, 10.0.4.0/24):
-  - Host NPA Publisher EC2 instances
-  - No direct internet access (egress via NAT Gateway)
-  - Route table: 0.0.0.0/0 → NAT Gateway (in same AZ)
+### NAT Gateways
 
-#### 3. Internet Gateway
-- **Purpose**: Provides internet connectivity for the VPC
-- **Used by**: NAT Gateways for outbound traffic
+**AWS best practice**: Deploy one NAT Gateway per Availability Zone so that resources in each AZ are not dependent on another AZ's gateway ([REL02-BP02](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_planning_horizontal_scaling.html)).
 
-#### 4. NAT Gateways (2 instances)
-- **Purpose**: Enable outbound internet access from private subnets
-- **Deployment**: One per availability zone for redundancy
-- **Benefits**:
-  - Zone-isolated failure domains
-  - Managed service (automatic scaling, patching)
-  - Static Elastic IP for consistent egress IP
+- Two NAT Gateways, one per AZ, each with a static Elastic IP
+- Zone-isolated failure domains: an AZ1 NAT Gateway failure does not affect AZ2
+- Managed service with automatic scaling and 99.99% SLA
 
-#### 5. EC2 Instances (NPA Publishers)
-- **Type**: t3.large (default, configurable)
+### EC2 Instances (NPA Publishers)
+
+**AWS best practice**: Use instance profiles for credential management instead of long-lived keys ([SEC02-BP02](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/sec_identities_unique.html)). Require IMDSv2 to prevent SSRF-based credential theft ([SEC06-BP02](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/sec_protect_compute_vulnerability_management.html)).
+
+- **Instance type**: t3.large (default, configurable)
 - **AMI**: Netskope Private Access Publisher (AWS Marketplace)
 - **Deployment**: Distributed across AZs using `for_each` with modulo distribution
 - **Networking**: Private subnet placement (no public IP)
-- **IAM**: Instance profile with Systems Manager permissions
+- **IAM**: Instance profile with Systems Manager permissions only
 - **IMDS**: v2 required (session tokens for SSRF protection)
 - **Storage**: 30 GB gp3 encrypted root volume
 - **Monitoring**: Detailed CloudWatch monitoring enabled
-- **User Data**: Minimal (CloudWatch agent only if enabled); registration via SSM Run Command
+- **User Data**: Minimal (CloudWatch agent only if enabled); registration via SSM Automation
 
-#### 6. Security Groups
-- **Ingress**: None — publishers only initiate outbound connections
+### Security Groups
+
+**AWS best practice**: Apply the principle of least privilege to network access ([SEC05-BP02](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/sec_network_protection_create_layers.html)).
+
+- **Ingress**: None — publishers only initiate outbound connections, giving them zero inbound attack surface
 - **Egress**: All outbound traffic allowed (0.0.0.0/0, all ports and protocols)
-  - Publishers require connectivity to Netskope NewEdge, DNS, package repositories, and internal applications
+  - Egress is unrestricted because publishers must reach Netskope NewEdge, DNS, package repositories, and internal applications — destinations that vary per deployment
 
-#### 7. Netskope Terraform Provider
-- **Purpose**: Creates and manages publisher records in Netskope tenant
-- **Resources**:
-  - `netskope_npa_publisher`: Publisher registration in Netskope
-  - `netskope_npa_publisher_token`: One-time registration tokens
-- **Authentication**: API key (set via environment variable or tfvars)
+### VPC Endpoints
 
-#### 8. Terraform State Backend (Optional)
+**AWS best practice**: Use VPC endpoints for AWS service traffic to keep it on the AWS private network and avoid NAT Gateway data processing charges ([SEC05-BP03](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/sec_network_protection_inspection.html)).
+
+- Three Interface VPC Endpoints: `ssm`, `ssmmessages`, `ec2messages`
+- SSM agent traffic stays within the AWS network, never traversing the NAT Gateway or public internet
+- Enables Session Manager access to instances in private subnets without SSH or bastion hosts
+
+### Netskope Provider
+
+The Netskope Terraform provider creates publisher records and generates one-time registration tokens used during the SSM Automation registration step. It does not manage any AWS infrastructure.
+
+- `netskope_npa_publisher`: Creates publisher records in the Netskope tenant
+- `netskope_npa_publisher_token`: Generates one-time registration tokens
+- Authentication: API key (set via environment variable or tfvars)
+
+### Terraform State Backend (Optional)
+
+**AWS best practice**: Encrypt state at rest with customer-managed KMS keys and use locking to prevent concurrent modifications ([SEC08-BP01](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/sec_protect_data_rest_encrypt.html)).
+
 - **S3 Bucket**: Encrypted state file storage with versioning
-- **DynamoDB Table**: State locking for concurrent access protection
-- **KMS Key**: Customer-managed encryption key for state
-- **See**: [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for details
+- **DynamoDB Table**: State locking (PAY_PER_REQUEST) for concurrent access protection
+- **KMS Key**: Customer-managed encryption key
+- See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for details
 
-#### 9. CloudWatch (Optional)
+### CloudWatch (Optional)
+
 - **Agent**: Memory and disk metrics (when `enable_cloudwatch_monitoring = true`)
 - **SSM Parameter**: Stores CloudWatch agent configuration
 - **Namespace**: `NPA/Publisher` for custom metrics
@@ -174,30 +162,29 @@ Comprehensive architecture documentation for the Netskope Private Access (NPA) P
 
 #### 1. Publisher to Netskope NewEdge
 ```
-NPA Publisher → Security Group (egress rules) → NAT Gateway →
+NPA Publisher → Security Group (egress) → NAT Gateway →
 Internet Gateway → Internet → Netskope NewEdge Data Centers
 ```
 - **Port**: HTTPS (443)
-- **Destination**: Netskope NewEdge IP ranges
-- **Purpose**: Publisher registration, management, tunnel establishment
+- **Purpose**: Publisher registration, management plane, tunnel establishment
 
 #### 2. Publisher to Internal Applications
 ```
-NPA Publisher → Security Group (egress rules) →
+NPA Publisher → Security Group (egress) →
 VPC Internal / Peered VPCs / On-Premises (via VPN/Direct Connect)
 ```
 - **Ports**: Application-specific
 - **Destination**: RFC1918 private IP ranges
-- **Purpose**: Proxying user traffic to internal applications
+- **Purpose**: Proxying user traffic to internal applications via Netskope tunnels
 
-#### 3. Systems Manager Communication
+#### 3. AWS Service Traffic (via VPC Endpoints)
 ```
 NPA Publisher → VPC Endpoint (Interface) →
 AWS Systems Manager Service Endpoints
 ```
 - **Port**: HTTPS (443)
-- **Purpose**: SSM agent communication, Session Manager access, publisher registration via SSM Run Command
-- **Note**: SSM traffic uses Interface VPC endpoints (`ssm`, `ssmmessages`, `ec2messages`), keeping traffic within the AWS network without routing through the NAT Gateway. Publisher registration is delivered via SSM Run Command after the instance is confirmed online.
+- **Purpose**: SSM agent communication, Session Manager access, publisher registration via SSM Automation
+- VPC endpoints keep this traffic on the AWS private network, avoiding NAT Gateway data processing costs and removing a dependency on outbound internet for management operations
 
 #### 4. Terraform Operator to AWS / Netskope APIs
 ```
@@ -206,25 +193,29 @@ Terraform Operator → AWS APIs (create/manage resources)
 ```
 - **Port**: HTTPS (443)
 - **Source**: Operator workstation or CI/CD pipeline
-- **Purpose**: Infrastructure provisioning and management
 
 ### Network Segmentation
 
-#### Isolation Strategy
-1. **Data Plane Isolation**: Publishers in private subnets with no direct internet access
-2. **Management Plane Access**: Via Systems Manager Session Manager (no SSH/bastion required)
-3. **Control Plane**: Terraform operator runs from external location (workstation/CI/CD)
+**AWS best practice**: Separate data, management, and control plane traffic using VPC constructs ([SEC05-BP01](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/sec_network_protection_create_layers.html)).
 
-#### Security Zones
+| Plane | Traffic | AWS Mechanism |
+|---|---|---|
+| **Data Plane** | Publisher ↔ Netskope NewEdge, internal apps | Private subnets → NAT Gateway → Internet / VPC peering |
+| **Management Plane** | Operator ↔ Publisher (shell access, diagnostics) | Systems Manager Session Manager via VPC endpoints — no SSH, no bastion |
+| **Control Plane** | Terraform ↔ AWS APIs, Netskope APIs | External (operator workstation / CI/CD) over HTTPS |
+
+**Security Zones:**
 - **Public Zone**: NAT Gateways only (no compute resources)
 - **Private Zone**: NPA Publishers (compute resources)
 - **External**: Terraform operator, Netskope NewEdge
 
 ## Security Architecture
 
-### Defense in Depth — Multi-Layer Security
+This architecture implements defense in depth aligned to the [AWS Well-Architected Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html). Each layer references specific Security Pillar best practices.
 
-#### Layer 1: Network Security
+#### Layer 1: Network Security (SEC05)
+
+> *SEC05-BP01: Create network layers* — SEC05-BP02: *Control traffic flow within network layers*
 
 **VPC-Level Controls:**
 - Private subnet placement for all compute resources
@@ -243,32 +234,33 @@ Egress Rules:
               package repositories, and internal applications
 ```
 
-#### Layer 2: IAM Least Privilege
+**VPC Endpoints:**
+- SSM traffic stays on the AWS private network (`ssm`, `ssmmessages`, `ec2messages`)
+- Eliminates the need for public internet access for management operations
 
-**EC2 Instance Role:**
-```yaml
-Permissions:
-  - AmazonSSMManagedInstanceCore          # SSM agent communication
-  - ssm:GetParameter (custom policy)      # Publisher registration tokens
-  - CloudWatchAgentServerPolicy           # CloudWatch agent (conditional)
-  - ssm:GetParameter (custom policy)      # CloudWatch config (conditional)
+#### Layer 2: Identity and Access Management (SEC02, SEC03)
 
-Restrictions:
-  - No EC2 control plane permissions
-  - No access to secrets services
-  - No PassRole permissions
-  - Cannot create/modify/delete infrastructure
-```
+> *SEC02-BP02: Use temporary credentials* — *SEC03-BP01: Define access requirements* — *SEC03-BP07: Analyze cross-account access*
 
-**Terraform Operator:**
-- Requires permissions to manage all resources in the configuration
-- See [IAM_PERMISSIONS.md](IAM_PERMISSIONS.md) for minimum policy
+**Three-role separation** ensures least privilege:
 
-#### Layer 3: State Encryption
+| Role | Assumed By | Purpose |
+|---|---|---|
+| **EC2 Instance Role** | `ec2.amazonaws.com` | SSM agent communication, CloudWatch agent (conditional). No access to registration tokens or infrastructure control plane. |
+| **SSM Automation Role** | `ssm.amazonaws.com` | Server-side token resolution — reads registration tokens from SSM Parameter Store and runs registration on publisher instances. Token never leaves AWS. |
+| **Terraform Operator** | Human / CI/CD | Manages all resources; additionally requires `ssm:StartAutomationExecution`, `ssm:GetAutomationExecution`, and `iam:PassRole` for the automation workflow. |
+
+**Design rationale:**
+- The EC2 instance role has no access to registration tokens — this is handled entirely by the SSM Automation role server-side, so tokens never transit the instance metadata service or operator workstation
+- The SSM Automation role trust policy is limited to `ssm.amazonaws.com` and its `SendCommand` scope is restricted to publisher instances and `AWS-RunShellScript`
+- See [IAM_PERMISSIONS.md](IAM_PERMISSIONS.md) for minimum operator policy and [DEVOPS-NOTES.md](DEVOPS-NOTES.md#iam-configuration) for full permission enumerations
+
+#### Layer 3: Data Protection at Rest (SEC08)
+
+> *SEC08-BP01: Implement secure key management* — *SEC08-BP02: Enforce encryption at rest*
 
 **Terraform State Security:**
 - **At rest**: KMS encryption with customer-managed key
-- **In transit**: HTTPS enforced via S3 bucket policy
 - **Access control**: IAM policies on S3 bucket and KMS key
 - **Versioning**: S3 versioning for state recovery
 - **Locking**: DynamoDB prevents concurrent modifications
@@ -278,34 +270,34 @@ Restrictions:
 - Publisher registration tokens (single-use)
 - EC2 instance metadata, IAM configurations
 
-> **Comparison with CloudFormation**: The CF version uses AWS Secrets Manager to store the API token and delivers registration tokens via SSM Run Command. This Terraform version follows a similar pattern — registration tokens are stored in SSM Parameter Store (SecureString) and delivered via SSM Run Command. The API key is in the provider configuration (and thus in state). The S3+KMS backend provides encryption at rest.
-
 See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for comprehensive state security guidance.
 
-#### Layer 4: Data Encryption
+#### Layer 4: Data Protection in Transit (SEC09)
 
-**Encryption in Transit:**
+> *SEC09-BP01: Implement secure key and certificate management* — *SEC09-BP02: Enforce encryption in transit*
+
 - All AWS API calls: TLS 1.2+ (AWS SDK enforced)
 - Netskope communication: TLS 1.3 (Netskope enforced)
 - State transfers: HTTPS to S3
-
-**Encryption at Rest:**
 - EBS root volumes: Encrypted (gp3)
-- Terraform state: KMS-encrypted in S3
-- CloudWatch agent config: SSM Parameter Store
+- SSM Parameter Store: SecureString for registration tokens
 
-#### Layer 5: Access Control
+#### Layer 5: Access Control (SEC02, SEC06)
+
+> *SEC06-BP02: Reduce attack surface* — *SEC02-BP06: Employ user lifecycle management*
 
 **Management Access:**
 - **No SSH Required**: Systems Manager Session Manager for shell access
 - **No Bastion Hosts**: Direct SSM connection from AWS Console or CLI
-- **IMDSv2 Enforced**: Session tokens required for metadata access
+- **IMDSv2 Enforced**: Session tokens required for metadata access (SSRF protection)
 
 **API Access:**
 - **Netskope API**: Token-based authentication (set via environment variable)
 - **AWS API**: IAM-based authentication (SigV4)
 
-#### Layer 6: Code Quality and Pre-commit
+#### Layer 6: Code Quality and Pre-commit (SEC01)
+
+> *SEC01-BP06: Automate testing and validation of security controls*
 
 **Automated Security Scanning:**
 - **tfsec**: Terraform-specific security scanner
@@ -321,37 +313,6 @@ See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for comprehensive state security 
 - **terraform-docs**: Auto-generated documentation
 
 See [DEVOPS-NOTES.md](DEVOPS-NOTES.md) for pre-commit hook details.
-
-### Security Best Practices Implemented
-
-#### OWASP Top 10 for Infrastructure
-
-1. **A01: Broken Access Control**
-   - IAM least privilege enforced
-   - No public access to resources
-   - Security group ingress blocked
-
-2. **A02: Cryptographic Failures**
-   - State encrypted with KMS
-   - TLS enforced for all communication
-   - EBS volumes encrypted
-
-3. **A07: Identification and Authentication Failures**
-   - IAM role-based authentication
-   - No hardcoded credentials (pre-commit hooks enforce this)
-   - Token-based API authentication
-
-4. **A09: Security Logging and Monitoring Failures**
-   - CloudWatch monitoring available
-   - SSM session logging
-   - CloudTrail for API audit (recommended)
-
-#### CIS AWS Foundations Benchmark
-
-- **4.1**: No unrestricted ingress on port 22
-- **4.2**: No unrestricted ingress on port 3389
-- **2.1**: CloudWatch monitoring available
-- **5.1**: VPC flow logs available (user-enabled)
 
 ## High Availability Design
 
@@ -431,150 +392,6 @@ publisher_instance_type = "t3.xlarge"
 - **Single Instance**: Minutes (`terraform apply -replace`)
 - **Availability Zone**: 0 seconds (automatic failover)
 - **Entire Stack**: ~5-8 minutes (`terraform apply` from scratch)
-
-## AWS Well-Architected Alignment
-
-### 1. Reliability
-- Multi-AZ deployment
-- Managed services (NAT Gateway)
-- Infrastructure as Code (repeatable deployments)
-- `for_each` prevents cascading state changes
-
-### 2. Security
-- Defense in depth (6 layers)
-- IAM least privilege
-- Encrypted state and volumes
-- Pre-commit security scanning
-- No public IP addresses
-
-### 3. Performance Efficiency
-- Right-sized instances (configurable)
-- Zone-local NAT Gateways
-- gp3 EBS volumes (latest generation)
-
-### 4. Cost Optimization
-- No Lambda function costs
-- No Secrets Manager costs
-- PAY_PER_REQUEST DynamoDB for state locking
-- Configurable instance types and count
-
-### 5. Operational Excellence
-- Infrastructure as Code (Terraform)
-- Pre-commit hooks for quality gates
-- Automated documentation generation
-- Terraform plan as drift detection
-
-## Deployment Flow
-
-### Terraform Apply Sequence
-
-```
-1. Provider Initialization
-   ├─ AWS provider configured (region, profile, default_tags)
-   └─ Netskope provider configured (server_url, api_key)
-
-2. Data Source Queries
-   ├─ aws_availability_zones.available (query AZs)
-   └─ aws_ami.netskope_publisher (find latest AMI)
-
-3. VPC Resources (if create_vpc = true)
-   ├─ aws_vpc.this
-   ├─ aws_internet_gateway.this
-   ├─ aws_subnet.public (2)
-   ├─ aws_subnet.private (2)
-   ├─ aws_eip.nat (2)
-   ├─ aws_nat_gateway.this (2)
-   ├─ aws_route_table.public + aws_route_table.private (2)
-   ├─ aws_route_table_association (4)
-   └─ aws_vpc_endpoint (3: ssm, ssmmessages, ec2messages)
-
-4. Security Resources
-   └─ aws_security_group.publisher
-
-5. IAM Resources
-   ├─ aws_iam_role.publisher
-   ├─ aws_iam_instance_profile.publisher
-   └─ aws_iam_role_policy_attachment (SSM, CloudWatch)
-
-6. Netskope Resources
-   ├─ netskope_npa_publisher.this (for_each: create publishers)
-   └─ netskope_npa_publisher_token.this (for_each: generate tokens)
-
-7. SSM Resources
-   ├─ aws_ssm_parameter.publisher_token (for_each: store registration tokens)
-   └─ aws_ssm_parameter.cloudwatch_config (if enable_cloudwatch_monitoring = true)
-
-8. EC2 Instances
-   └─ aws_instance.publisher (for_each: launch instances)
-       └─ Optional: CloudWatch agent installation via user data
-
-9. Publisher Registration (null_resource.publisher_registration)
-   └─ for_each: poll SSM until instance is Online
-       ├─ Fetch token locally from SSM Parameter Store
-       ├─ Send registration command via SSM Run Command
-       └─ Wait for registration to complete
-
-Total Deployment Time: ~8-15 minutes (includes SSM polling)
-```
-
-### Terraform Destroy Sequence
-
-```
-1. EC2 Instances terminated
-2. Netskope publishers and tokens deleted (via provider)
-3. SSM parameters deleted (if created)
-4. IAM resources deleted
-5. Security group deleted
-6. VPC resources deleted (if created)
-   ├─ VPC endpoints removed
-   ├─ NAT Gateways released (EIPs freed)
-   ├─ Route tables and associations removed
-   ├─ Subnets deleted
-   ├─ Internet Gateway detached and deleted
-   └─ VPC deleted
-
-Total Destruction Time: ~3-5 minutes
-```
-
-## Resource Dependencies
-
-### Implicit Dependency Graph
-
-Terraform automatically determines resource creation order based on references:
-
-```
-aws_vpc.this
-  └─► aws_internet_gateway.this
-  └─► aws_subnet.public
-  │     └─► aws_eip.nat
-  │     └─► aws_nat_gateway.this
-  │           └─► aws_route_table.private
-  └─► aws_subnet.private
-  └─► aws_security_group.publisher
-
-aws_iam_role.publisher
-  └─► aws_iam_instance_profile.publisher
-  └─► aws_iam_role_policy_attachment
-
-netskope_npa_publisher.this
-  └─► netskope_npa_publisher_token.this
-
-aws_security_group.publisher ─┐
-aws_iam_instance_profile.publisher ─┤
-local.private_subnet_ids ─┤
-netskope_npa_publisher_token.this ─┤
-aws_nat_gateway.this ─┤
-                       └─► aws_instance.publisher
-                             └─► null_resource.publisher_registration
-                                   (polls SSM → fetches token → SSM Run Command)
-```
-
-### External Dependencies
-
-1. **Netskope Cloud**: Publisher management API must be reachable during `terraform apply`
-2. **AWS Marketplace**: NPA Publisher AMI must be subscribed
-3. **AWS Services**: EC2, VPC, IAM, SSM must be available in the target region
-4. **Internet Connectivity**: Required for Netskope communication from publishers
 
 ## Additional Resources
 
