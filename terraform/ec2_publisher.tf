@@ -81,22 +81,24 @@ resource "aws_instance" "publisher" {
 # ==============================================================================
 # After each EC2 instance launches, Terraform:
 #   1. Polls SSM until the instance appears as "Online" (SSM agent ready)
-#   2. Sends the registration command via SSM Run Command
-#   3. Waits for the command to complete
+#   2. Starts an SSM Automation execution that:
+#      a. Fetches the registration token server-side from SSM Parameter Store
+#      b. Runs the registration wizard on the instance via SSM Run Command
+#   3. Polls the automation execution until it completes
 #
-# This approach is more reliable than user data because:
-#   - Terraform waits for the instance and network to be fully ready
-#   - Registration output is captured in SSM command history
-#   - Failures are visible in the Terraform apply output
-#   - No dependency on NAT Gateway timing during cloud-init
+# The registration token never leaves AWS — it is resolved by the automation
+# document's aws:executeAwsApi step and passed directly to the instance.
 # ==============================================================================
 
 resource "null_resource" "publisher_registration" {
   for_each = local.publishers
 
+  depends_on = [aws_iam_role_policy.ssm_automation]
+
   triggers = {
-    instance_id = aws_instance.publisher[each.key].id
-    token_param = aws_ssm_parameter.publisher_token[each.key].name
+    instance_id     = aws_instance.publisher[each.key].id
+    token_param     = aws_ssm_parameter.publisher_token[each.key].name
+    ssm_doc_version = aws_ssm_document.publisher_registration.latest_version
   }
 
   # --------------------------------------------------------------------------
@@ -137,75 +139,65 @@ resource "null_resource" "publisher_registration" {
   }
 
   # --------------------------------------------------------------------------
-  # Step 2: Register Publisher via SSM Run Command
+  # Step 2: Register Publisher via SSM Automation
   # --------------------------------------------------------------------------
-  # Fetches the token locally from SSM Parameter Store, then passes it
-  # directly to the instance via SSM Run Command. This avoids requiring
-  # the AWS CLI on the publisher AMI.
+  # Starts an SSM Automation execution that:
+  #   1. Reads the registration token server-side from SSM Parameter Store
+  #   2. Runs the registration wizard on the instance via SSM Run Command
+  #
+  # The token never leaves AWS — it's resolved by the automation document's
+  # aws:executeAwsApi step and passed directly to the instance.
   # --------------------------------------------------------------------------
   provisioner "local-exec" {
     command = <<-EOT
-      echo "Fetching registration token from SSM Parameter Store..."
-      TOKEN=$(aws ssm get-parameter \
-        --name "${aws_ssm_parameter.publisher_token[each.key].name}" \
-        --with-decryption \
-        --query "Parameter.Value" \
-        --output text \
-        --region ${var.aws_region} \
-        --profile ${var.aws_profile != "" ? var.aws_profile : "default"})
-
-      echo "Registering publisher ${each.value.name} via SSM Run Command..."
-      COMMAND_ID=$(aws ssm send-command \
-        --instance-ids "${aws_instance.publisher[each.key].id}" \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands="[\"/home/ubuntu/npa_publisher_wizard -token $TOKEN\"]" \
-        --timeout-seconds 300 \
+      echo "Starting SSM Automation for publisher ${each.value.name}..."
+      EXECUTION_ID=$(aws ssm start-automation-execution \
+        --document-name "${aws_ssm_document.publisher_registration.name}" \
+        --parameters "InstanceId=${aws_instance.publisher[each.key].id},TokenParameterName=${aws_ssm_parameter.publisher_token[each.key].name}" \
         --region ${var.aws_region} \
         --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
-        --query "Command.CommandId" \
+        --query "AutomationExecutionId" \
         --output text)
 
-      echo "SSM Command ID: $COMMAND_ID"
+      echo "SSM Automation Execution ID: $EXECUTION_ID"
       echo "Waiting for registration to complete..."
 
-      aws ssm wait command-executed \
-        --command-id "$COMMAND_ID" \
-        --instance-id "${aws_instance.publisher[each.key].id}" \
-        --region ${var.aws_region} \
-        --profile ${var.aws_profile != "" ? var.aws_profile : "default"} 2>/dev/null || true
-
-      STATUS=$(aws ssm get-command-invocation \
-        --command-id "$COMMAND_ID" \
-        --instance-id "${aws_instance.publisher[each.key].id}" \
-        --region ${var.aws_region} \
-        --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
-        --query "Status" \
-        --output text)
-
-      OUTPUT=$(aws ssm get-command-invocation \
-        --command-id "$COMMAND_ID" \
-        --instance-id "${aws_instance.publisher[each.key].id}" \
-        --region ${var.aws_region} \
-        --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
-        --query "StandardOutputContent" \
-        --output text)
-
-      echo "Registration output: $OUTPUT"
-
-      if [ "$STATUS" != "Success" ]; then
-        ERROR=$(aws ssm get-command-invocation \
-          --command-id "$COMMAND_ID" \
-          --instance-id "${aws_instance.publisher[each.key].id}" \
+      MAX_ATTEMPTS=40
+      ATTEMPT=0
+      while true; do
+        ATTEMPT=$((ATTEMPT + 1))
+        STATUS=$(aws ssm get-automation-execution \
+          --automation-execution-id "$EXECUTION_ID" \
           --region ${var.aws_region} \
           --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
-          --query "StandardErrorContent" \
+          --query "AutomationExecution.AutomationExecutionStatus" \
           --output text)
-        echo "ERROR: Registration failed with status $STATUS"
-        echo "Error output: $ERROR"
-        exit 1
-      fi
 
-      echo "Publisher ${each.value.name} registered successfully"
+        if [ "$STATUS" = "Success" ]; then
+          echo "Publisher ${each.value.name} registered successfully"
+          break
+        fi
+
+        if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+          FAILURE_MSG=$(aws ssm get-automation-execution \
+            --automation-execution-id "$EXECUTION_ID" \
+            --region ${var.aws_region} \
+            --profile ${var.aws_profile != "" ? var.aws_profile : "default"} \
+            --query "AutomationExecution.FailureMessage" \
+            --output text)
+          echo "ERROR: Registration automation $STATUS"
+          echo "Failure message: $FAILURE_MSG"
+          exit 1
+        fi
+
+        if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+          echo "ERROR: Registration automation did not complete after $MAX_ATTEMPTS attempts"
+          exit 1
+        fi
+
+        echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS - Status: $STATUS - waiting 15s..."
+        sleep 15
+      done
     EOT
   }
 }

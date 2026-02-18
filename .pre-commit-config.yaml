@@ -46,10 +46,13 @@ repos:
         args:
           - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
 
-      # Run tfsec security scanner
-      - id: terraform_tfsec
-        name: tfsec Security Scan
+      # Run Trivy security scanner (replaces deprecated tfsec)
+      # Skipped checks are configured in .trivyignore
+      - id: terraform_trivy
+        name: Trivy Security Scan
         description: Scans Terraform for security issues
+        args:
+          - --args=--ignorefile=__GIT_WORKING_DIR__/.trivyignore
 
       # Run Checkov security scanner
       - id: terraform_checkov
@@ -57,8 +60,22 @@ repos:
         description: Scans for security and compliance misconfigurations
         args:
           - --args=--quiet
-          - --args=--skip-check=CKV_AWS_144  # Skip cross-region replication check
-          - --args=--skip-check=CKV_AWS_145  # Skip KMS encryption check for demo
+          - --args=--framework=terraform
+          # Skip known/intentional findings (see comments below for rationale):
+          - --args=--skip-check=CKV_AWS_144,CKV_AWS_145,CKV_AWS_260,CKV_AWS_382,CKV_AWS_23,CKV_AWS_130,CKV_AWS_135,CKV_AWS_337,CKV2_AWS_5,CKV2_AWS_12,CKV2_AWS_34,CKV2_AWS_11,CKV_SECRET_6
+          #   CKV_AWS_144:  Cross-region replication — not required
+          #   CKV_AWS_145:  SSM parameter KMS CMK — using default AWS-managed key
+          #   CKV_AWS_260:  Unrestricted egress — intentional for publisher connectivity
+          #   CKV_AWS_382:  Egress to 0.0.0.0/0 — intentional for publisher connectivity
+          #   CKV_AWS_23:   Security group description — false positive
+          #   CKV_AWS_130:  Public subnet assigns public IPs — NAT Gateway subnets only
+          #   CKV_AWS_135:  EC2 EBS optimized — not supported on all instance types
+          #   CKV_AWS_337:  SSM parameter KMS CMK — using default AWS-managed key for SecureString
+          #   CKV2_AWS_5:   SG attached to ENI — false positive (attached to instances)
+          #   CKV2_AWS_12:  Default VPC SG — not managed by this module
+          #   CKV2_AWS_34:  SSM param encryption — CloudWatch config is not a secret
+          #   CKV2_AWS_11:  VPC flow logging — optional hardening, not required
+          #   CKV_SECRET_6: Base64 string — false positive on example comment
 
   # ----------------------------------------------------------------------------
   # General File Checks

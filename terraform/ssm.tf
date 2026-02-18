@@ -1,32 +1,28 @@
 # ==============================================================================
-# SSM Parameters
+# SSM Parameters and Automation Documents
 # ==============================================================================
-# AWS Systems Manager (SSM) Parameter Store is a secure storage service for:
-#   - Configuration data
-#   - Secrets (with SecureString type)
-#   - Application settings
+# AWS Systems Manager (SSM) resources:
 #
-# Benefits over hardcoding values:
-#   - Centralized configuration management
-#   - Version history and audit trail
-#   - Fine-grained access control via IAM
-#   - Can be referenced by multiple resources/instances
+# Parameter Store — secure storage for configuration and secrets:
+#   - Registration tokens (SecureString, encrypted with KMS)
+#   - CloudWatch agent configuration (String)
 #
-# The CloudWatch agent can fetch its configuration directly from Parameter Store,
-# eliminating the need to bake config into AMIs or manage config files.
+# Automation Documents — server-side orchestration for publisher registration:
+#   - Fetches the token via aws:executeAwsApi (never leaves AWS)
+#   - Runs the registration command on the instance via aws:runCommand
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
 # NPA Publisher Registration Tokens
 # ------------------------------------------------------------------------------
 # Stores each publisher's registration token in SSM Parameter Store as a
-# SecureString. The EC2 instance fetches the token at boot via the AWS CLI
-# instead of having it embedded directly in user data.
+# SecureString. The SSM Automation Document reads these tokens server-side
+# during publisher registration (see aws_ssm_document.publisher_registration).
 #
-# Benefits over embedding tokens in user data:
+# Benefits:
 #   - Tokens are encrypted at rest with KMS
-#   - Not visible in EC2 instance metadata
-#   - Access controlled via IAM
+#   - Not visible in EC2 instance metadata or operator workstations
+#   - Access controlled via IAM (only the SSM automation role can read them)
 #   - Auditable via CloudTrail
 # ------------------------------------------------------------------------------
 resource "aws_ssm_parameter" "publisher_token" {
@@ -124,4 +120,73 @@ resource "aws_ssm_parameter" "cloudwatch_config" {
   })
 
   tags = { Name = "${var.publisher_name}-cloudwatch-config" }
+}
+
+# ------------------------------------------------------------------------------
+# SSM Automation Document: Publisher Registration
+# ------------------------------------------------------------------------------
+# Orchestrates publisher registration entirely server-side:
+#   1. getToken      — aws:executeAwsApi reads the SecureString token from
+#                      SSM Parameter Store (token never leaves AWS)
+#   2. registerPublisher — aws:runCommand executes the registration wizard
+#                          on the target instance with the resolved token
+#
+# The document assumes the ssm_automation IAM role (see iam.tf) which has
+# permission to read tokens and send commands to publisher instances.
+# ------------------------------------------------------------------------------
+resource "aws_ssm_document" "publisher_registration" {
+  name            = "${var.publisher_name}-publisher-registration"
+  document_type   = "Automation"
+  document_format = "YAML"
+
+  content = yamlencode({
+    schemaVersion = "0.3"
+    description   = "Register an NPA Publisher instance with Netskope using a token from SSM Parameter Store"
+    assumeRole    = aws_iam_role.ssm_automation.arn
+
+    parameters = {
+      InstanceId = {
+        type        = "String"
+        description = "EC2 instance ID of the publisher to register"
+      }
+      TokenParameterName = {
+        type        = "String"
+        description = "SSM Parameter Store name containing the registration token"
+      }
+    }
+
+    mainSteps = [
+      {
+        name   = "getToken"
+        action = "aws:executeAwsApi"
+        inputs = {
+          Service        = "ssm"
+          Api            = "GetParameter"
+          Name           = "{{ TokenParameterName }}"
+          WithDecryption = true
+        }
+        outputs = [
+          {
+            Name     = "token"
+            Selector = "$.Parameter.Value"
+            Type     = "String"
+          }
+        ]
+      },
+      {
+        name   = "registerPublisher"
+        action = "aws:runCommand"
+        inputs = {
+          DocumentName = "AWS-RunShellScript"
+          InstanceIds  = ["{{ InstanceId }}"]
+          Parameters = {
+            commands = ["/home/ubuntu/npa_publisher_wizard -token {{ getToken.token }}"]
+          }
+          TimeoutSeconds = 300
+        }
+      }
+    ]
+  })
+
+  tags = { Name = "${var.publisher_name}-publisher-registration" }
 }

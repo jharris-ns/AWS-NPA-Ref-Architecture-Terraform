@@ -103,29 +103,6 @@ resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
 }
 
 # ------------------------------------------------------------------------------
-# SSM Parameter Access Policy: Publisher Registration Tokens
-# ------------------------------------------------------------------------------
-# Allows instances to read their registration tokens from SSM Parameter Store.
-# Uses GetParameter with WithDecryption for SecureString parameters.
-# Scoped to only the /npa/publishers/* path for least privilege.
-# ------------------------------------------------------------------------------
-data "aws_iam_policy_document" "publisher_token_access" {
-  statement {
-    effect  = "Allow"
-    actions = ["ssm:GetParameter"]
-    resources = [
-      for param in aws_ssm_parameter.publisher_token : param.arn
-    ]
-  }
-}
-
-resource "aws_iam_role_policy" "publisher_token_access" {
-  name   = "publisher-token-access"
-  role   = aws_iam_role.publisher.id
-  policy = data.aws_iam_policy_document.publisher_token_access.json
-}
-
-# ------------------------------------------------------------------------------
 # SSM Parameter Access Policy: CloudWatch Config (Conditional)
 # ------------------------------------------------------------------------------
 # Custom policy to allow reading the CloudWatch agent configuration from
@@ -158,4 +135,107 @@ resource "aws_iam_role_policy" "cloudwatch_config_access" {
   name   = "cloudwatch-config-access"
   role   = aws_iam_role.publisher.id
   policy = data.aws_iam_policy_document.cloudwatch_config_access[0].json
+}
+
+# ------------------------------------------------------------------------------
+# SSM Automation Role
+# ------------------------------------------------------------------------------
+# IAM role assumed by the SSM Automation service to execute the publisher
+# registration document. This keeps the registration token server-side —
+# the token is fetched by SSM (via aws:executeAwsApi) and passed directly
+# to the instance (via aws:runCommand), never transiting the operator's
+# workstation.
+# ------------------------------------------------------------------------------
+data "aws_iam_policy_document" "ssm_automation_assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["ssm.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "ssm_automation" {
+  name               = "${var.publisher_name}-ssm-automation-role"
+  assume_role_policy = data.aws_iam_policy_document.ssm_automation_assume_role.json
+
+  tags = { Name = "${var.publisher_name}-ssm-automation-role" }
+}
+
+# ------------------------------------------------------------------------------
+# SSM Automation Permissions Policy
+# ------------------------------------------------------------------------------
+# Grants the automation role the minimum permissions needed to:
+#   1. Read publisher registration tokens from SSM Parameter Store
+#   2. Send commands to publisher instances via SSM Run Command
+#   3. Check command execution status
+#   4. Describe instances (required by SendCommand to resolve targets)
+# ------------------------------------------------------------------------------
+data "aws_iam_policy_document" "ssm_automation_policy" {
+  # Read registration tokens from SSM Parameter Store
+  statement {
+    effect  = "Allow"
+    actions = ["ssm:GetParameter"]
+    resources = [
+      "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter/npa/publishers/*/registration-token"
+    ]
+  }
+
+  # Send commands to publisher instances
+  statement {
+    effect = "Allow"
+    actions = [
+      "ssm:SendCommand",
+    ]
+    resources = [
+      "arn:aws:ssm:${data.aws_region.current.id}::document/AWS-RunShellScript",
+    ]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "ssm:SendCommand",
+    ]
+    resources = [
+      for instance in aws_instance.publisher : instance.arn
+    ]
+  }
+
+  # Check command execution status (ListCommands is required by SSM Automation
+  # internally to verify aws:runCommand step completion)
+  statement {
+    effect = "Allow"
+    actions = [
+      "ssm:GetCommandInvocation",
+      "ssm:ListCommands",
+      "ssm:ListCommandInvocations",
+    ]
+    resources = ["*"]
+  }
+
+  # Describe instances (required by SendCommand to resolve targets)
+  statement {
+    effect    = "Allow"
+    actions   = ["ec2:DescribeInstances"]
+    resources = ["*"]
+  }
+
+  # Describe SSM-managed instances (required by SSM Automation to verify
+  # SSM Agent availability before executing RunCommand steps)
+  statement {
+    effect    = "Allow"
+    actions   = ["ssm:DescribeInstanceInformation"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "ssm_automation" {
+  name   = "ssm-automation-permissions"
+  role   = aws_iam_role.ssm_automation.id
+  policy = data.aws_iam_policy_document.ssm_automation_policy.json
 }

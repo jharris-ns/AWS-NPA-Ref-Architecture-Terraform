@@ -20,3 +20,11 @@
 data "aws_availability_zones" "available" {
   state = "available"
 }
+
+# ------------------------------------------------------------------------------
+# Current AWS Account and Region
+# ------------------------------------------------------------------------------
+# Used for constructing IAM policy ARNs scoped to the current account/region.
+# ------------------------------------------------------------------------------
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
