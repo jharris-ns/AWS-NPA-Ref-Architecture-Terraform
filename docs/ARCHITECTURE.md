@@ -213,7 +213,7 @@ Terraform Operator → AWS APIs (create/manage resources)
 
 This architecture implements defense in depth aligned to the [AWS Well-Architected Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html). Each layer references specific Security Pillar best practices.
 
-#### Layer 1: Network Security (SEC05)
+### Layer 1: Network Security (SEC05)
 
 > *SEC05-BP01: Create network layers* — SEC05-BP02: *Control traffic flow within network layers*
 
@@ -238,7 +238,7 @@ Egress Rules:
 - SSM traffic stays on the AWS private network (`ssm`, `ssmmessages`, `ec2messages`)
 - Eliminates the need for public internet access for management operations
 
-#### Layer 2: Identity and Access Management (SEC02, SEC03)
+### Layer 2: Identity and Access Management (SEC02, SEC03)
 
 > *SEC02-BP02: Use temporary credentials* — *SEC03-BP01: Define access requirements* — *SEC03-BP07: Analyze cross-account access*
 
@@ -255,7 +255,7 @@ Egress Rules:
 - The SSM Automation role trust policy is limited to `ssm.amazonaws.com` and its `SendCommand` scope is restricted to publisher instances and `AWS-RunShellScript`
 - See [IAM_PERMISSIONS.md](IAM_PERMISSIONS.md) for minimum operator policy and [DEVOPS-NOTES.md](DEVOPS-NOTES.md#iam-configuration) for full permission enumerations
 
-#### Layer 3: Data Protection at Rest (SEC08)
+### Layer 3: Data Protection at Rest (SEC08)
 
 > *SEC08-BP01: Implement secure key management* — *SEC08-BP02: Enforce encryption at rest*
 
@@ -272,7 +272,7 @@ Egress Rules:
 
 See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for comprehensive state security guidance.
 
-#### Layer 4: Data Protection in Transit (SEC09)
+### Layer 4: Data Protection in Transit (SEC09)
 
 > *SEC09-BP01: Implement secure key and certificate management* — *SEC09-BP02: Enforce encryption in transit*
 
@@ -282,7 +282,7 @@ See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for comprehensive state security 
 - EBS root volumes: Encrypted (gp3)
 - SSM Parameter Store: SecureString for registration tokens
 
-#### Layer 5: Access Control (SEC02, SEC06)
+### Layer 5: Access Control (SEC02, SEC06)
 
 > *SEC06-BP02: Reduce attack surface* — *SEC02-BP06: Employ user lifecycle management*
 
@@ -295,7 +295,7 @@ See [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) for comprehensive state security 
 - **Netskope API**: Token-based authentication (set via environment variable)
 - **AWS API**: IAM-based authentication (SigV4)
 
-#### Layer 6: Code Quality and Pre-commit (SEC01)
+### Layer 6: Code Quality and Pre-commit (SEC01)
 
 > *SEC01-BP06: Automate testing and validation of security controls*
 
