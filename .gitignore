@@ -127,5 +127,4 @@ terraform/tests/
 # Local testing scripts
 local-*.sh
 test-*.sh
-/CLAUDE.md
 /.claude/
